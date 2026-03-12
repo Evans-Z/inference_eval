@@ -1,10 +1,10 @@
 """Entry point for inference_eval."""
 
-from inference_eval import __version__
+from inference_eval.cli import cli
 
 
 def main() -> None:
-    print(f"inference_eval v{__version__}")
+    cli()
 
 
 if __name__ == "__main__":

@@ -1,21 +1,29 @@
 [project]
 name = "inference-eval"
 version = "0.1.0"
-description = "Inference evaluation toolkit"
+description = "Decouple inference from evaluation using lm-eval-harness"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.12"
-dependencies = []
+requires-python = ">=3.10"
+dependencies = [
+    "lm-eval>=0.4.0",
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+vllm = ["vllm>=0.6.0"]
+sglang = ["sglang[all]>=0.3.0"]
+openai = ["openai>=1.0.0"]
 
 [project.scripts]
-inference-eval = "inference_eval.main:main"
+inference-eval = "inference_eval.cli:cli"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py310"
 line-length = 88
 
 [tool.ruff.lint]
