@@ -93,6 +93,12 @@ class TestRenderSummary:
         assert "gsm8k" in table
         assert "hellaswag" in table
 
+    def test_uses_short_metric_names(self):
+        entries = [make_entry("m", _MOCK_EVAL_RESULTS)]
+        table = render_summary(entries)
+        assert "em_flex" in table
+        assert "acc_norm" in table
+
     def test_filter_tasks(self):
         entries = [make_entry("m", _MOCK_EVAL_RESULTS)]
         table = render_summary(entries, tasks=["gsm8k"])
@@ -163,6 +169,37 @@ class TestSummaryCLI:
             )
             assert result.exit_code == 0
             assert Path("out.csv").exists()
+
+
+class TestCSVAutoGeneration:
+    def test_csv_created_on_append(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jsonl_path = Path(tmpdir) / "sb.jsonl"
+            csv_path = Path(tmpdir) / "sb.csv"
+            append_entry(make_entry("model-a", _MOCK_EVAL_RESULTS), jsonl_path)
+            assert csv_path.exists()
+            content = csv_path.read_text()
+            assert "model-a" in content
+            assert "gsm8k" in content
+
+    def test_csv_updated_on_second_append(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jsonl_path = Path(tmpdir) / "sb.jsonl"
+            csv_path = Path(tmpdir) / "sb.csv"
+            append_entry(make_entry("model-a", _MOCK_EVAL_RESULTS), jsonl_path)
+            append_entry(make_entry("model-b", _MOCK_EVAL_RESULTS), jsonl_path)
+            content = csv_path.read_text()
+            assert "model-a" in content
+            assert "model-b" in content
+
+    def test_csv_export_string(self):
+        from inference_eval.scoreboard import export_csv_string
+
+        entries = [make_entry("m", _MOCK_EVAL_RESULTS)]
+        csv_str = export_csv_string(entries)
+        assert "Tag" in csv_str
+        assert "gsm8k" in csv_str
+        assert "0.7500" in csv_str
 
 
 class TestEvaluateCLITag:

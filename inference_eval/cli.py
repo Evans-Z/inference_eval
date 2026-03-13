@@ -398,8 +398,8 @@ def convert(
     "--format",
     "fmt",
     type=str,
-    default="simple_outline",
-    help="Table format (any tabulate format, e.g. github, csv, grid)",
+    default="simple_grid",
+    help="Table format (any tabulate format, e.g. github, grid, pipe)",
 )
 @click.option(
     "--tag",
@@ -407,7 +407,13 @@ def convert(
     default=None,
     help="Show only entries matching this tag",
 )
-@click.option("--csv", "csv_file", type=str, default=None, help="Export to CSV file")
+@click.option(
+    "--csv",
+    "csv_file",
+    type=str,
+    default=None,
+    help="Export to CSV file",
+)
 def summary(
     scoreboard: str | None,
     tasks: str | None,
@@ -422,11 +428,17 @@ def summary(
     Reads the scoreboard built up by 'evaluate --tag' calls:
       inference-eval summary
       inference-eval summary --tasks gsm8k,mmlu
-      inference-eval summary --format github
       inference-eval summary --csv results.csv
+      inference-eval summary --format github
+
+    \b
+    A CSV file (scoreboard.csv) is also auto-generated alongside
+    the JSONL file every time 'evaluate --tag' is run, so you can
+    always open it in Excel / Google Sheets.
     """
     from inference_eval.scoreboard import (
         DEFAULT_SCOREBOARD,
+        export_csv_string,
         load_entries,
         render_summary,
     )
@@ -446,9 +458,9 @@ def summary(
     click.echo(table)
 
     if csv_file:
-        csv_table = render_summary(entries, tasks=task_list, metric=metric, fmt="tsv")
-        with open(csv_file, "w") as f:
-            f.write(csv_table)
+        csv_content = export_csv_string(entries, tasks=task_list, metric=metric)
+        with open(csv_file, "w", newline="") as f:
+            f.write(csv_content)
         click.echo(f"\nExported to {csv_file}")
 
 
