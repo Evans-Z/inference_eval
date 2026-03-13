@@ -19,6 +19,7 @@ ENGINE_REGISTRY: dict[str, str] = {
     "vllm": "inference_eval.inference.vllm_engine.VLLMEngine",
     "sglang": "inference_eval.inference.sglang_engine.SGLangEngine",
     "openai": "inference_eval.inference.openai_engine.OpenAIEngine",
+    "server": "inference_eval.inference.server_engine.ServerEngine",
 }
 
 

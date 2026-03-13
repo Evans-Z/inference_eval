@@ -109,28 +109,69 @@ def extract(
 
 @cli.command()
 @click.option(
-    "--requests", "-r", required=True, help="Directory containing extracted requests"
+    "--requests",
+    "-r",
+    required=True,
+    help="Directory containing extracted requests",
 )
 @click.option(
-    "--output", "-o", required=True, help="Output directory for inference results"
+    "--output",
+    "-o",
+    required=True,
+    help="Output directory for inference results",
 )
 @click.option(
-    "--engine", "-e", required=True, help="Inference engine (vllm, sglang, openai)"
+    "--engine",
+    "-e",
+    required=True,
+    help="Inference engine: vllm, sglang, openai, server",
 )
 @click.option("--model", "-m", required=True, help="Model name or path")
 @click.option(
-    "--engine-args", type=str, default="{}", help="JSON string of engine kwargs"
+    "--base-url",
+    type=str,
+    default=None,
+    help="Server URL (for server/openai engine, e.g. http://localhost:8068/v1)",
 )
-@click.option("--batch-size", "-b", type=int, default=32, help="Batch size")
 @click.option(
-    "--tasks", "-t", type=str, default=None, help="Comma-separated task names to filter"
+    "--max-concurrent",
+    type=int,
+    default=None,
+    help="Max parallel requests (server/openai engine, default 64)",
 )
-@click.option("--verbosity", type=str, default="INFO", help="Logging verbosity")
+@click.option(
+    "--engine-args",
+    type=str,
+    default="{}",
+    help="JSON string of extra engine kwargs",
+)
+@click.option(
+    "--batch-size",
+    "-b",
+    type=int,
+    default=32,
+    help="Batch size for process_requests calls",
+)
+@click.option(
+    "--tasks",
+    "-t",
+    type=str,
+    default=None,
+    help="Comma-separated task names to filter",
+)
+@click.option(
+    "--verbosity",
+    type=str,
+    default="INFO",
+    help="Logging verbosity",
+)
 def infer(
     requests: str,
     output: str,
     engine: str,
     model: str,
+    base_url: str | None,
+    max_concurrent: int | None,
     engine_args: str,
     batch_size: int,
     tasks: str | None,
@@ -138,14 +179,26 @@ def infer(
 ) -> None:
     """Run inference on extracted requests using a specified engine.
 
-    Reads requests from the extract output, runs them through the
-    inference engine, and saves results for evaluation.
+    \b
+    Examples:
+      # Local vLLM (batched)
+      inference-eval infer -r ./requests -o ./results \\
+          -e vllm -m meta-llama/Llama-3-8B-Instruct
+    \b
+      # Running vLLM / SGLang server
+      inference-eval infer -r ./requests -o ./results \\
+          -e server -m meta-llama/Llama-3-8B-Instruct \\
+          --base-url http://localhost:8068/v1 --max-concurrent 64
     """
     _setup_logging(verbosity)
     from inference_eval.infer import run_inference
 
     kwargs = json.loads(engine_args)
     kwargs["model"] = model
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    if max_concurrent is not None:
+        kwargs["max_concurrent"] = max_concurrent
 
     task_list = [t.strip() for t in tasks.split(",")] if tasks else None
 
