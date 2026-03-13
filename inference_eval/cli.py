@@ -140,6 +140,17 @@ def extract(
     help="Max parallel requests (server/openai engine, default 64)",
 )
 @click.option(
+    "--api-type",
+    type=click.Choice(["auto", "completions", "chat"]),
+    default=None,
+    help=(
+        "API endpoint type for server engine: "
+        "'completions' (/v1/completions), "
+        "'chat' (/v1/chat/completions), "
+        "or 'auto' (try completions, fall back to chat)"
+    ),
+)
+@click.option(
     "--engine-args",
     type=str,
     default="{}",
@@ -172,6 +183,7 @@ def infer(
     model: str,
     base_url: str | None,
     max_concurrent: int | None,
+    api_type: str | None,
     engine_args: str,
     batch_size: int,
     tasks: str | None,
@@ -185,10 +197,15 @@ def infer(
       inference-eval infer -r ./requests -o ./results \\
           -e vllm -m meta-llama/Llama-3-8B-Instruct
     \b
-      # Running vLLM / SGLang server
+      # Running vLLM / SGLang server (auto-detect API)
       inference-eval infer -r ./requests -o ./results \\
-          -e server -m meta-llama/Llama-3-8B-Instruct \\
+          -e server -m Qwen3-8B \\
           --base-url http://localhost:8068/v1 --max-concurrent 64
+    \b
+      # Force chat completions endpoint
+      inference-eval infer -r ./requests -o ./results \\
+          -e server -m Qwen3-8B \\
+          --base-url http://localhost:8068/v1 --api-type chat
     """
     _setup_logging(verbosity)
     from inference_eval.infer import run_inference
@@ -199,6 +216,8 @@ def infer(
         kwargs["base_url"] = base_url
     if max_concurrent is not None:
         kwargs["max_concurrent"] = max_concurrent
+    if api_type is not None:
+        kwargs["api_type"] = api_type
 
     task_list = [t.strip() for t in tasks.split(",")] if tasks else None
 

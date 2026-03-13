@@ -24,8 +24,8 @@ _DEFAULT_TIMEOUT = 600  # seconds per request
 class ServerEngine(InferenceEngine):
     """Inference engine that talks to an already-running server.
 
-    Works with any server that exposes ``/v1/completions`` (OpenAI
-    completions API), including:
+    Works with any server that exposes ``/v1/completions`` **or**
+    ``/v1/chat/completions`` (OpenAI-compatible API), including:
 
     * ``vllm serve <model> --port 8068``
     * ``python -m sglang.launch_server --port 8068``
@@ -40,6 +40,14 @@ class ServerEngine(InferenceEngine):
         api_key: Bearer token.  Defaults to ``"EMPTY"`` (vLLM default).
         max_concurrent: Maximum number of in-flight HTTP requests.
         timeout: Per-request timeout in seconds.
+        api_type: Which endpoint to use.
+
+            * ``"auto"`` (default) — tries ``/v1/completions`` first;
+              if the server returns 404 falls back to
+              ``/v1/chat/completions`` for the rest of the session.
+            * ``"completions"`` — always use ``/v1/completions``.
+            * ``"chat"`` — always use ``/v1/chat/completions``.
+              Prompts are sent as a single ``user`` message.
     """
 
     def __init__(
@@ -49,6 +57,7 @@ class ServerEngine(InferenceEngine):
         api_key: str = "EMPTY",
         max_concurrent: int = 64,
         timeout: int = _DEFAULT_TIMEOUT,
+        api_type: str = "auto",
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -57,6 +66,14 @@ class ServerEngine(InferenceEngine):
         self.api_key = api_key
         self.max_concurrent = max_concurrent
         self.timeout = timeout
+
+        if api_type not in ("auto", "completions", "chat"):
+            raise ValueError(
+                f"api_type must be 'auto', 'completions', or 'chat', got '{api_type}'"
+            )
+        self._api_type: str = api_type
+        self._resolved_type: str | None = None if api_type == "auto" else api_type
+
         self._session = http_requests.Session()
         self._session.headers.update(
             {
@@ -65,10 +82,11 @@ class ServerEngine(InferenceEngine):
             }
         )
         logger.info(
-            "ServerEngine: model=%s  url=%s  concurrency=%d",
+            "ServerEngine: model=%s  url=%s  concurrency=%d  api_type=%s",
             model,
             self.base_url,
             max_concurrent,
+            api_type,
         )
 
     # ------------------------------------------------------------------
@@ -82,8 +100,72 @@ class ServerEngine(InferenceEngine):
         resp.raise_for_status()
         return resp.json()
 
-    def _completions(self, payload: dict) -> dict:
-        return self._post("completions", payload)
+    def _resolve_api_type(self) -> str:
+        """Auto-detect whether the server supports completions or chat."""
+        if self._resolved_type is not None:
+            return self._resolved_type
+
+        probe = {
+            "model": self.model,
+            "prompt": "hi",
+            "max_tokens": 1,
+            "temperature": 0.0,
+        }
+        url = f"{self.base_url}/completions"
+        try:
+            resp = self._session.post(url, json=probe, timeout=min(self.timeout, 30))
+            if resp.status_code != 404:
+                self._resolved_type = "completions"
+                logger.info(
+                    "Auto-detected api_type='completions' "
+                    "(server supports /v1/completions)"
+                )
+                return "completions"
+        except http_requests.RequestException:
+            pass
+
+        self._resolved_type = "chat"
+        logger.info(
+            "Auto-detected api_type='chat' "
+            "(/v1/completions returned 404, using /v1/chat/completions)"
+        )
+        return "chat"
+
+    # ------------------------------------------------------------------
+    # unified request helpers
+    # ------------------------------------------------------------------
+
+    def _generate_one_completions(self, prompt: str, kw: dict[str, Any]) -> str:
+        """Generate via /v1/completions."""
+        stop = kw.get("until", kw.get("stop", []))
+        if isinstance(stop, str):
+            stop = [stop]
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "prompt": prompt,
+            "max_tokens": kw.get("max_gen_toks", kw.get("max_tokens", 256)),
+            "temperature": kw.get("temperature", 0.0),
+        }
+        if stop:
+            payload["stop"] = stop
+        data = self._post("completions", payload)
+        return data["choices"][0]["text"]
+
+    def _generate_one_chat(self, prompt: str, kw: dict[str, Any]) -> str:
+        """Generate via /v1/chat/completions."""
+        stop = kw.get("until", kw.get("stop", []))
+        if isinstance(stop, str):
+            stop = [stop]
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": kw.get("max_gen_toks", kw.get("max_tokens", 256)),
+            "temperature": kw.get("temperature", 0.0),
+        }
+        if stop:
+            payload["stop"] = stop
+        data = self._post("chat/completions", payload)
+        return data["choices"][0]["message"]["content"]
 
     # ------------------------------------------------------------------
     # generate  (concurrent)
@@ -97,24 +179,17 @@ class ServerEngine(InferenceEngine):
         if not prompts:
             return []
 
+        api = self._resolve_api_type()
         results: list[str | None] = [None] * len(prompts)
         t0 = time.perf_counter()
 
         def _one(idx: int) -> tuple[int, str]:
             kw = gen_kwargs[idx]
-            stop = kw.get("until", kw.get("stop", []))
-            if isinstance(stop, str):
-                stop = [stop]
-            payload = {
-                "model": self.model,
-                "prompt": prompts[idx],
-                "max_tokens": kw.get("max_gen_toks", kw.get("max_tokens", 256)),
-                "temperature": kw.get("temperature", 0.0),
-            }
-            if stop:
-                payload["stop"] = stop
-            data = self._completions(payload)
-            return idx, data["choices"][0]["text"]
+            if api == "chat":
+                text = self._generate_one_chat(prompts[idx], kw)
+            else:
+                text = self._generate_one_completions(prompts[idx], kw)
+            return idx, text
 
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as pool:
             futures = {pool.submit(_one, i): i for i in range(len(prompts))}
@@ -148,6 +223,11 @@ class ServerEngine(InferenceEngine):
 
         Requires the server to support ``echo=true`` and ``logprobs``
         (vLLM and some other servers do; vanilla OpenAI does not).
+
+        Note: log-likelihood computation always uses ``/v1/completions``
+        because ``/v1/chat/completions`` does not support ``echo``.
+        If your server only exposes the chat endpoint, this will raise
+        an error for loglikelihood-based tasks (e.g. hellaswag, mmlu).
         """
         if not contexts:
             return []
@@ -160,7 +240,7 @@ class ServerEngine(InferenceEngine):
             cont = continuations[idx]
             full = ctx + cont
 
-            payload = {
+            payload: dict[str, Any] = {
                 "model": self.model,
                 "prompt": full,
                 "max_tokens": 0,
@@ -168,7 +248,22 @@ class ServerEngine(InferenceEngine):
                 "logprobs": 1,
                 "temperature": 0.0,
             }
-            data = self._completions(payload)
+            try:
+                data = self._post("completions", payload)
+            except http_requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    raise RuntimeError(
+                        "Log-likelihood computation requires the "
+                        "/v1/completions endpoint with echo+logprobs "
+                        "support.  Your server only exposes "
+                        "/v1/chat/completions which does not support "
+                        "this.  Use a server that exposes /v1/completions "
+                        "for loglikelihood-based tasks (hellaswag, mmlu, "
+                        "etc.), or switch to a generate_until-only task "
+                        "(gsm8k, etc.)."
+                    ) from exc
+                raise
+
             choice = data["choices"][0]
             lp_data = choice.get("logprobs")
             if not lp_data or not lp_data.get("token_logprobs"):

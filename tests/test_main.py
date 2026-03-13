@@ -47,5 +47,6 @@ def test_infer_help():
     assert result.exit_code == 0
     assert "--base-url" in result.output
     assert "--max-concurrent" in result.output
+    assert "--api-type" in result.output
     assert "--engine" in result.output
     assert "server" in result.output
