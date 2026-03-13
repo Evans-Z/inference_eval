@@ -327,7 +327,7 @@ class ServerEngine(InferenceEngine):
                 "prompt": full,
                 "max_tokens": 0,
                 "echo": True,
-                "logprobs": 1,
+                "logprobs": 0,
                 "temperature": 0.0,
             }
             try:
