@@ -278,6 +278,18 @@ def infer(
     help="Allow execution of unsafe task code",
 )
 @click.option("--log-samples", is_flag=True, help="Log individual sample results")
+@click.option(
+    "--tag",
+    type=str,
+    default=None,
+    help="Tag for this run (e.g. 'qwen3-8b-fp16'). Appends to scoreboard.",
+)
+@click.option(
+    "--scoreboard",
+    type=str,
+    default=None,
+    help="Path to scoreboard JSONL (default: scoreboard.jsonl)",
+)
 @click.option("--verbosity", type=str, default="INFO", help="Logging verbosity")
 def evaluate(
     results: str,
@@ -288,12 +300,22 @@ def evaluate(
     limit: float | None,
     confirm_run_unsafe_code: bool,
     log_samples: bool,
+    tag: str | None,
+    scoreboard: str | None,
     verbosity: str,
 ) -> None:
     """Evaluate inference results using lm-eval-harness metrics.
 
+    \b
     Feeds pre-computed results back to lm-eval-harness for metric
     computation and displays scores.
+    \b
+    Use --tag to record results in a scoreboard for cross-model comparison:
+      inference-eval evaluate -r ./results/qwen3 --requests ./requests \\
+          --tag qwen3-8b-fp16
+      inference-eval evaluate -r ./results/llama3 --requests ./requests \\
+          --tag llama3-8b-int4
+      inference-eval summary   # view comparison table
     """
     _setup_logging(verbosity)
     from inference_eval.evaluate import evaluate_results
@@ -311,6 +333,8 @@ def evaluate(
         confirm_run_unsafe_code=confirm_run_unsafe_code,
         log_samples=log_samples,
         verbosity=verbosity,
+        tag=tag,
+        scoreboard=scoreboard,
     )
 
 
@@ -346,6 +370,86 @@ def convert(
     click.echo(f"\nConverted results saved to {output}:")
     for key, count in sorted(counts.items()):
         click.echo(f"  {key}: {count} results")
+
+
+@cli.command()
+@click.option(
+    "--scoreboard",
+    "-s",
+    type=str,
+    default=None,
+    help="Path to scoreboard JSONL (default: scoreboard.jsonl)",
+)
+@click.option(
+    "--tasks",
+    "-t",
+    type=str,
+    default=None,
+    help="Comma-separated task names to show (default: all)",
+)
+@click.option(
+    "--metric",
+    "-m",
+    type=str,
+    default=None,
+    help="Force this metric for all tasks (default: auto-pick)",
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=str,
+    default="simple_outline",
+    help="Table format (any tabulate format, e.g. github, csv, grid)",
+)
+@click.option(
+    "--tag",
+    type=str,
+    default=None,
+    help="Show only entries matching this tag",
+)
+@click.option("--csv", "csv_file", type=str, default=None, help="Export to CSV file")
+def summary(
+    scoreboard: str | None,
+    tasks: str | None,
+    metric: str | None,
+    fmt: str,
+    tag: str | None,
+    csv_file: str | None,
+) -> None:
+    """Display a comparison table of all evaluated models.
+
+    \b
+    Reads the scoreboard built up by 'evaluate --tag' calls:
+      inference-eval summary
+      inference-eval summary --tasks gsm8k,mmlu
+      inference-eval summary --format github
+      inference-eval summary --csv results.csv
+    """
+    from inference_eval.scoreboard import (
+        DEFAULT_SCOREBOARD,
+        load_entries,
+        render_summary,
+    )
+
+    sb_path = scoreboard or DEFAULT_SCOREBOARD
+    entries = load_entries(sb_path)
+    if not entries:
+        click.echo(f"No entries found in {sb_path}")
+        return
+
+    if tag:
+        entries = [e for e in entries if e.get("tag") == tag]
+
+    task_list = [t.strip() for t in tasks.split(",")] if tasks else None
+
+    table = render_summary(entries, tasks=task_list, metric=metric, fmt=fmt)
+    click.echo(table)
+
+    if csv_file:
+        csv_table = render_summary(entries, tasks=task_list, metric=metric, fmt="tsv")
+        with open(csv_file, "w") as f:
+            f.write(csv_table)
+        click.echo(f"\nExported to {csv_file}")
 
 
 if __name__ == "__main__":

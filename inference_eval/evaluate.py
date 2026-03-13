@@ -25,12 +25,18 @@ def evaluate_results(
     confirm_run_unsafe_code: bool = False,
     verbosity: str = "INFO",
     log_samples: bool = False,
+    tag: str | None = None,
+    scoreboard: str | Path | None = None,
 ) -> dict[str, Any]:
     """Evaluate pre-computed results using lm-eval-harness metrics.
 
     Supports per-task ``num_fewshot`` / ``limit`` that were saved
     during extraction.  Tasks with different settings are evaluated
     in separate ``simple_evaluate`` calls and the results are merged.
+
+    When *tag* is provided the results are also appended to a
+    persistent **scoreboard** JSONL file, enabling cross-model
+    comparison via ``inference-eval summary``.
 
     Args:
         results_dir: Directory containing inference results.
@@ -44,6 +50,10 @@ def evaluate_results(
         confirm_run_unsafe_code: Allow unsafe task code execution.
         verbosity: Logging verbosity level.
         log_samples: Whether to log individual sample results.
+        tag: Identifier for this run (e.g. model name + settings).
+            When set, results are appended to the scoreboard.
+        scoreboard: Path to the scoreboard JSONL file.
+            Defaults to ``scoreboard.jsonl`` in the current directory.
 
     Returns:
         Dictionary containing evaluation results with task metrics.
@@ -124,6 +134,17 @@ def evaluate_results(
         with open(output_path, "w") as f:
             json.dump(serializable, f, indent=2, default=str)
         logger.info("Scores saved to %s", output_path)
+
+    if tag is not None:
+        from inference_eval.scoreboard import (
+            DEFAULT_SCOREBOARD,
+            append_entry,
+            make_entry,
+        )
+
+        sb_path = Path(scoreboard) if scoreboard else Path(DEFAULT_SCOREBOARD)
+        entry = make_entry(tag, merged_results)
+        append_entry(entry, sb_path)
 
     _print_results(merged_results)
     return merged_results
