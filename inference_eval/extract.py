@@ -51,6 +51,8 @@ def extract_requests(
     """
     output_dir = Path(output_dir)
 
+    per_task = {t: {"num_fewshot": num_fewshot, "limit": limit} for t in tasks}
+
     config = ExtractConfig(
         tasks=tasks,
         num_fewshot=num_fewshot,
@@ -61,6 +63,7 @@ def extract_requests(
         fewshot_random_seed=fewshot_random_seed,
         apply_chat_template=apply_chat_template,
         system_instruction=system_instruction,
+        task_settings=per_task,
     )
 
     capture_lm = RequestCaptureLM()

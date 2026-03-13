@@ -28,8 +28,9 @@ def evaluate_results(
 ) -> dict[str, Any]:
     """Evaluate pre-computed results using lm-eval-harness metrics.
 
-    Loads results from disk, runs lm-eval-harness with an OfflineLM
-    that returns the pre-computed results, and computes task metrics.
+    Supports per-task ``num_fewshot`` / ``limit`` that were saved
+    during extraction.  Tasks with different settings are evaluated
+    in separate ``simple_evaluate`` calls and the results are merged.
 
     Args:
         results_dir: Directory containing inference results.
@@ -37,8 +38,9 @@ def evaluate_results(
             If None, tasks and other params must be provided explicitly.
         tasks: Task names to evaluate. Overrides config from requests_dir.
         output_file: Optional path to save evaluation scores as JSON.
-        num_fewshot: Number of few-shot examples. Overrides config.
-        limit: Example limit per task. Overrides config.
+        num_fewshot: Number of few-shot examples. Overrides ALL per-task
+            settings when provided explicitly on the CLI.
+        limit: Example limit per task. Overrides ALL per-task settings.
         confirm_run_unsafe_code: Allow unsafe task code execution.
         verbosity: Logging verbosity level.
         log_samples: Whether to log individual sample results.
@@ -64,12 +66,6 @@ def evaluate_results(
             "--requests-dir containing config.json from extraction."
         )
 
-    eval_num_fewshot = (
-        num_fewshot
-        if num_fewshot is not None
-        else (config.num_fewshot if config else None)
-    )
-    eval_limit = limit if limit is not None else (config.limit if config else None)
     random_seed = config.random_seed if config else 0
     numpy_random_seed = config.numpy_random_seed if config else 1234
     torch_random_seed = config.torch_random_seed if config else 1234
@@ -77,31 +73,100 @@ def evaluate_results(
 
     offline_lm = OfflineLM(results_dir)
 
-    logger.info("Evaluating tasks: %s", eval_tasks)
-    eval_results = lm_eval.simple_evaluate(
-        model=offline_lm,
-        tasks=eval_tasks,
-        num_fewshot=eval_num_fewshot,
-        limit=eval_limit,
-        random_seed=random_seed,
-        numpy_random_seed=numpy_random_seed,
-        torch_random_seed=torch_random_seed,
-        fewshot_random_seed=fewshot_random_seed,
-        verbosity=verbosity,
-        log_samples=log_samples,
-        confirm_run_unsafe_code=confirm_run_unsafe_code,
+    # ------------------------------------------------------------------
+    # Group tasks by their per-task settings so each group can be
+    # evaluated with the correct num_fewshot / limit.
+    # ------------------------------------------------------------------
+    cli_override_fewshot = num_fewshot is not None
+    cli_override_limit = limit is not None
+
+    task_settings = config.task_settings if config else {}
+    groups = _group_tasks_by_settings(
+        eval_tasks,
+        task_settings,
+        default_fewshot=config.num_fewshot if config else None,
+        default_limit=config.limit if config else None,
+        override_fewshot=num_fewshot if cli_override_fewshot else None,
+        override_limit=limit if cli_override_limit else None,
+        cli_override_fewshot=cli_override_fewshot,
+        cli_override_limit=cli_override_limit,
     )
+
+    merged_results: dict[str, Any] = {}
+
+    for (group_fewshot, group_limit), group_tasks in groups.items():
+        logger.info(
+            "Evaluating %d task(s) with num_fewshot=%s, limit=%s: %s",
+            len(group_tasks),
+            group_fewshot,
+            group_limit,
+            group_tasks,
+        )
+        group_eval = lm_eval.simple_evaluate(
+            model=offline_lm,
+            tasks=group_tasks,
+            num_fewshot=group_fewshot,
+            limit=group_limit,
+            random_seed=random_seed,
+            numpy_random_seed=numpy_random_seed,
+            torch_random_seed=torch_random_seed,
+            fewshot_random_seed=fewshot_random_seed,
+            verbosity=verbosity,
+            log_samples=log_samples,
+            confirm_run_unsafe_code=confirm_run_unsafe_code,
+        )
+        _merge_eval_results(merged_results, group_eval)
 
     if output_file is not None:
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        serializable = _make_serializable(eval_results)
+        serializable = _make_serializable(merged_results)
         with open(output_path, "w") as f:
             json.dump(serializable, f, indent=2, default=str)
         logger.info("Scores saved to %s", output_path)
 
-    _print_results(eval_results)
-    return eval_results
+    _print_results(merged_results)
+    return merged_results
+
+
+# ------------------------------------------------------------------
+# helpers
+# ------------------------------------------------------------------
+
+_SettingsKey = tuple[int | None, int | float | None]
+
+
+def _group_tasks_by_settings(
+    eval_tasks: list[str],
+    task_settings: dict[str, dict[str, Any]],
+    *,
+    default_fewshot: int | None,
+    default_limit: int | float | None,
+    override_fewshot: int | None,
+    override_limit: int | float | None,
+    cli_override_fewshot: bool,
+    cli_override_limit: bool,
+) -> dict[_SettingsKey, list[str]]:
+    """Group tasks that share the same (num_fewshot, limit)."""
+    groups: dict[_SettingsKey, list[str]] = {}
+    for task in eval_tasks:
+        ts = task_settings.get(task, {})
+        nf = (
+            override_fewshot
+            if cli_override_fewshot
+            else ts.get("num_fewshot", default_fewshot)
+        )
+        lim = override_limit if cli_override_limit else ts.get("limit", default_limit)
+        key: _SettingsKey = (nf, lim)
+        groups.setdefault(key, []).append(task)
+    return groups
+
+
+def _merge_eval_results(merged: dict[str, Any], new: dict[str, Any]) -> None:
+    """Merge *new* eval results dict into *merged* in-place."""
+    for top_key in ("results", "configs", "versions", "n-shot", "samples"):
+        if top_key in new:
+            merged.setdefault(top_key, {}).update(new[top_key])
 
 
 def _make_serializable(obj: Any) -> Any:

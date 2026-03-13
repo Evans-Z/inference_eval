@@ -32,6 +32,7 @@ class ExtractConfig:
     system_instruction: str | None = None
     task_group_map: dict[str, list[str]] = field(default_factory=dict)
     extracted_tasks: list[str] = field(default_factory=list)
+    task_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def save(self, output_dir: Path) -> None:
         """Save config, merging with any existing config in the directory."""
@@ -63,6 +64,10 @@ class ExtractConfig:
         self.extracted_tasks = _dedup_ordered(
             existing.extracted_tasks + self.extracted_tasks
         )
+
+        merged_settings = dict(existing.task_settings)
+        merged_settings.update(self.task_settings)
+        self.task_settings = merged_settings
 
     @classmethod
     def load(cls, input_dir: Path) -> ExtractConfig:
