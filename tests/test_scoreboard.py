@@ -97,7 +97,7 @@ class TestRenderSummary:
         entries = [make_entry("m", _MOCK_EVAL_RESULTS)]
         table = render_summary(entries)
         assert "em_flex" in table
-        assert "acc_norm" in table
+        assert "hellaswag (acc)" in table
 
     def test_filter_tasks(self):
         entries = [make_entry("m", _MOCK_EVAL_RESULTS)]

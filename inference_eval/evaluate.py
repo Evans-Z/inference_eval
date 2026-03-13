@@ -146,7 +146,7 @@ def evaluate_results(
         entry = make_entry(tag, merged_results)
         append_entry(entry, sb_path)
 
-    _print_results(merged_results)
+    _print_results_compact(merged_results, tag)
     return merged_results
 
 
@@ -207,26 +207,43 @@ def _make_serializable(obj: Any) -> Any:
     return str(obj)
 
 
-def _print_results(eval_results: dict[str, Any]) -> None:
-    """Print evaluation results in a readable format."""
+def _print_results_compact(eval_results: dict[str, Any], tag: str | None) -> None:
+    """Print a compact one-line-per-task summary."""
     results = eval_results.get("results", {})
     if not results:
         logger.warning("No results to display")
         return
 
-    print("\n" + "=" * 70)
-    print("EVALUATION RESULTS")
-    print("=" * 70)
+    from inference_eval.scoreboard import _pick_primary_metric, _short_metric
 
+    print()
+    if tag:
+        print(f"[{tag}]")
     for task_name, metrics in sorted(results.items()):
-        print(f"\n{task_name}:")
-        if isinstance(metrics, dict):
-            for metric_name, value in sorted(metrics.items()):
-                if metric_name.startswith("alias"):
-                    continue
-                if isinstance(value, float):
-                    print(f"  {metric_name}: {value:.4f}")
-                else:
-                    print(f"  {metric_name}: {value}")
-
-    print("\n" + "=" * 70)
+        if not isinstance(metrics, dict):
+            continue
+        available = {
+            k
+            for k, v in metrics.items()
+            if isinstance(v, (int, float))
+            and not k.startswith("alias")
+            and "stderr" not in k
+        }
+        pm = _pick_primary_metric(task_name, available)
+        if pm and pm in metrics:
+            short = _short_metric(pm)
+            print(f"  {task_name:30s} {short}={metrics[pm]:.4f}")
+        else:
+            first = next(
+                (
+                    (k, v)
+                    for k, v in sorted(metrics.items())
+                    if isinstance(v, (int, float))
+                    and not k.startswith("alias")
+                    and "stderr" not in k
+                ),
+                None,
+            )
+            if first:
+                print(f"  {task_name:30s} {first[0]}={first[1]:.4f}")
+    print()

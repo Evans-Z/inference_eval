@@ -25,8 +25,8 @@ DEFAULT_SCOREBOARD = "scoreboard.jsonl"
 _PREFERRED_METRICS = [
     "exact_match,flexible-extract",
     "exact_match,strict-match",
-    "acc_norm,none",
     "acc,none",
+    "acc_norm,none",
     "mc2",
     "f1,none",
     "em,none",
