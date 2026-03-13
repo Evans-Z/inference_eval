@@ -22,6 +22,8 @@ class ExtractConfig:
     fewshot_random_seed: int = 1234
     apply_chat_template: bool = False
     system_instruction: str | None = None
+    task_group_map: dict[str, list[str]] = field(default_factory=dict)
+    extracted_tasks: list[str] = field(default_factory=list)
 
     def save(self, output_dir: Path) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)

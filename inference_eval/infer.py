@@ -9,6 +9,7 @@ from typing import Any
 
 from inference_eval.inference.base import InferenceEngine
 from inference_eval.schema import (
+    ExtractConfig,
     load_requests,
     save_results,
 )
@@ -36,6 +37,86 @@ def get_engine(engine_name: str, engine_kwargs: dict[str, Any]) -> InferenceEngi
     module = importlib.import_module(module_path)
     engine_class = getattr(module, class_name)
     return engine_class(**engine_kwargs)
+
+
+def _expand_task_names(
+    task_filters: list[str],
+    available_tasks: set[str],
+    requests_dir: Path | None = None,
+) -> set[str]:
+    """Expand user-level task names to actual sub-task names.
+
+    Handles lm-eval-harness task groups (e.g. ``mmlu`` →
+    ``mmlu_abstract_algebra``, ``mmlu_anatomy``, …) using:
+
+    1. The ``task_group_map`` saved in ``config.json`` during extraction.
+    2. Prefix matching (``X`` matches any task starting with ``X_``).
+    """
+    # Try to load the group map from config.json
+    group_map: dict[str, list[str]] = {}
+    if requests_dir is not None:
+        config_path = requests_dir / "config.json"
+        if config_path.exists():
+            try:
+                cfg = ExtractConfig.load(requests_dir)
+                group_map = cfg.task_group_map
+            except Exception:
+                pass
+
+    expanded: set[str] = set()
+    for name in task_filters:
+        if name in available_tasks:
+            expanded.add(name)
+            continue
+
+        # Check group map first (precise)
+        if name in group_map:
+            expanded.update(group_map[name])
+            logger.info(
+                "Expanded task group '%s' → %d sub-tasks (from config)",
+                name,
+                len(group_map[name]),
+            )
+            continue
+
+        # Prefix fallback (e.g. "mmlu" matches "mmlu_abstract_algebra")
+        prefix_matches = {t for t in available_tasks if t.startswith(name + "_")}
+        if prefix_matches:
+            expanded.update(prefix_matches)
+            logger.info(
+                "Expanded task group '%s' → %d sub-tasks (prefix match)",
+                name,
+                len(prefix_matches),
+            )
+            continue
+
+        logger.warning(
+            "Task '%s' not found. Available tasks: %s",
+            name,
+            sorted(available_tasks)[:20],
+        )
+
+    return expanded
+
+
+def _filter_by_tasks(
+    all_requests: list,
+    tasks: list[str],
+    requests_dir: Path,
+) -> list:
+    """Filter requests by task names, expanding groups as needed."""
+    available = {r.task_name for r in all_requests}
+    expanded = _expand_task_names(tasks, available, requests_dir)
+    filtered = [r for r in all_requests if r.task_name in expanded]
+
+    if not filtered and all_requests:
+        logger.warning(
+            "No requests matched task filter %s. Available tasks in requests dir: %s",
+            tasks,
+            sorted(available),
+        )
+
+    return filtered
 
 
 def run_inference(
@@ -67,8 +148,7 @@ def run_inference(
 
     all_requests = load_requests(requests_dir)
     if tasks:
-        task_set = set(tasks)
-        all_requests = [r for r in all_requests if r.task_name in task_set]
+        all_requests = _filter_by_tasks(all_requests, tasks, requests_dir)
 
     logger.info("Running inference on %d requests", len(all_requests))
 
