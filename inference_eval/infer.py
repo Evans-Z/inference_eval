@@ -165,17 +165,11 @@ def run_inference(
     all_results = []
     for i in range(0, len(all_requests), batch_size):
         batch = all_requests[i : i + batch_size]
-        logger.info(
-            "Processing batch %d/%d (%d requests)",
-            i // batch_size + 1,
-            (len(all_requests) + batch_size - 1) // batch_size,
-            len(batch),
-        )
         batch_results = engine.process_requests(batch)
         all_results.extend(batch_results)
 
     counts = save_results(all_results, output_dir, group_map)
-    logger.info("Saved %d results", len(all_results))
+    logger.info("Saved %d results to %s", len(all_results), output_dir)
     return counts
 
 

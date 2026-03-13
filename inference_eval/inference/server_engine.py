@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import requests as http_requests
+from requests.adapters import HTTPAdapter
+from tqdm import tqdm
 
 from inference_eval.inference.base import InferenceEngine
 
@@ -88,6 +90,14 @@ class ServerEngine(InferenceEngine):
                 "Content-Type": "application/json",
             }
         )
+        # Size the connection pool to match concurrency so connections
+        # are reused instead of discarded with urllib3 warnings.
+        adapter = HTTPAdapter(
+            pool_connections=max_concurrent,
+            pool_maxsize=max_concurrent,
+        )
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
 
         # Validate model name against server early so the user gets a
         # clear error before processing thousands of requests.
@@ -153,21 +163,12 @@ class ServerEngine(InferenceEngine):
 
     @staticmethod
     def _is_model_not_found(resp: http_requests.Response) -> bool:
-        """Return True if a 404 response is a model-name error.
-
-        vLLM returns JSON like::
-
-            {"message": "The model `X` does not exist.",
-             "type": "NotFoundError", "param": "model", "code": 404}
-
-        A *route-level* 404 typically returns HTML or an empty body.
-        """
+        """Return True if a 404 response is a model-name error."""
         try:
             body = resp.json()
         except Exception:
             return False
 
-        # vLLM / OpenAI nested {"error": {...}} format
         err = body.get("error", body)
         if isinstance(err, dict):
             if err.get("param") == "model":
@@ -183,13 +184,7 @@ class ServerEngine(InferenceEngine):
         return False
 
     def _resolve_api_type(self) -> str:
-        """Auto-detect whether the server supports completions or chat.
-
-        Sends a tiny probe to ``/v1/completions``.  If the 404 is due
-        to the *endpoint* not existing we fall back to chat.  If it is
-        due to a wrong *model name* we raise immediately — falling back
-        would hit the same error.
-        """
+        """Auto-detect whether the server supports completions or chat."""
         if self._resolved_type is not None:
             return self._resolved_type
 
@@ -210,7 +205,6 @@ class ServerEngine(InferenceEngine):
                 )
                 return "completions"
 
-            # Got 404 — is it a model-name error or a missing route?
             if self._is_model_not_found(resp):
                 available = self._try_list_models_safe()
                 raise ValueError(
@@ -243,7 +237,6 @@ class ServerEngine(InferenceEngine):
     # ------------------------------------------------------------------
 
     def _generate_one_completions(self, prompt: str, kw: dict[str, Any]) -> str:
-        """Generate via /v1/completions."""
         stop = kw.get("until", kw.get("stop", []))
         if isinstance(stop, str):
             stop = [stop]
@@ -259,7 +252,6 @@ class ServerEngine(InferenceEngine):
         return data["choices"][0]["text"]
 
     def _generate_one_chat(self, prompt: str, kw: dict[str, Any]) -> str:
-        """Generate via /v1/chat/completions."""
         stop = kw.get("until", kw.get("stop", []))
         if isinstance(stop, str):
             stop = [stop]
@@ -275,7 +267,7 @@ class ServerEngine(InferenceEngine):
         return data["choices"][0]["message"]["content"]
 
     # ------------------------------------------------------------------
-    # generate  (concurrent)
+    # generate  (concurrent, single tqdm bar)
     # ------------------------------------------------------------------
 
     def generate(
@@ -300,17 +292,15 @@ class ServerEngine(InferenceEngine):
 
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as pool:
             futures = {pool.submit(_one, i): i for i in range(len(prompts))}
-            done = 0
-            for future in as_completed(futures):
-                idx, text = future.result()
-                results[idx] = text
-                done += 1
-                if done % max(1, len(prompts) // 10) == 0 or done == len(prompts):
-                    logger.info("  generate progress: %d/%d", done, len(prompts))
+            with tqdm(total=len(prompts), desc="generate", unit="req") as pbar:
+                for future in as_completed(futures):
+                    idx, text = future.result()
+                    results[idx] = text
+                    pbar.update(1)
 
         elapsed = time.perf_counter() - t0
         logger.info(
-            "ServerEngine.generate: %d prompts in %.1fs (%.1f req/s)",
+            "generate: %d prompts in %.1fs (%.1f req/s)",
             len(prompts),
             elapsed,
             len(prompts) / max(elapsed, 0.001),
@@ -318,7 +308,7 @@ class ServerEngine(InferenceEngine):
         return [r if r is not None else "" for r in results]
 
     # ------------------------------------------------------------------
-    # loglikelihood  (concurrent, requires echo+logprobs support)
+    # loglikelihood  (concurrent, single tqdm bar)
     # ------------------------------------------------------------------
 
     def compute_loglikelihood(
@@ -333,8 +323,6 @@ class ServerEngine(InferenceEngine):
 
         Note: log-likelihood computation always uses ``/v1/completions``
         because ``/v1/chat/completions`` does not support ``echo``.
-        If your server only exposes the chat endpoint, this will raise
-        an error for loglikelihood-based tasks (e.g. hellaswag, mmlu).
         """
         if not contexts:
             return []
@@ -405,21 +393,15 @@ class ServerEngine(InferenceEngine):
 
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as pool:
             futures = {pool.submit(_one, i): i for i in range(len(contexts))}
-            done = 0
-            for future in as_completed(futures):
-                idx, result = future.result()
-                results[idx] = result
-                done += 1
-                if done % max(1, len(contexts) // 10) == 0 or done == len(contexts):
-                    logger.info(
-                        "  loglikelihood progress: %d/%d",
-                        done,
-                        len(contexts),
-                    )
+            with tqdm(total=len(contexts), desc="loglikelihood", unit="req") as pbar:
+                for future in as_completed(futures):
+                    idx, result = future.result()
+                    results[idx] = result
+                    pbar.update(1)
 
         elapsed = time.perf_counter() - t0
         logger.info(
-            "ServerEngine.loglikelihood: %d items in %.1fs (%.1f req/s)",
+            "loglikelihood: %d items in %.1fs (%.1f req/s)",
             len(contexts),
             elapsed,
             len(contexts) / max(elapsed, 0.001),
@@ -435,11 +417,7 @@ class ServerEngine(InferenceEngine):
         context: str,
         continuation: str,
     ) -> int:
-        """Approximate the boundary between context and continuation tokens.
-
-        Walks through the token list and accumulates text until we reach
-        approximately the context length.
-        """
+        """Approximate the boundary between context and continuation tokens."""
         accumulated = ""
         ctx_len = len(context)
         for i, tok in enumerate(tokens):

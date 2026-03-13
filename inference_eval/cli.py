@@ -17,6 +17,9 @@ def _setup_logging(verbosity: str) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Silence noisy third-party loggers that spam during inference
+    for name in ("urllib3", "requests", "httpx", "httpcore", "filelock"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 @click.group()
