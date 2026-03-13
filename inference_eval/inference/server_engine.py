@@ -306,14 +306,11 @@ class ServerEngine(InferenceEngine):
     ) -> list[tuple[float, bool]]:
         """Compute log-likelihoods via the completions API.
 
-        Two API calls per request: context-only (to count tokens) and
-        context+continuation (to get logprobs for continuation tokens).
+        Requires the server to support ``echo=true`` and ``logprobs``
+        (vLLM and some other servers do; vanilla OpenAI does not).
 
-        ``is_greedy`` is always set to True for consistency with the
-        local VLLMEngine and because it does not affect the metrics
-        used by common tasks (acc, acc_norm, exact_match).
-
-        Requires ``echo=true`` and ``logprobs`` support (vLLM, etc.).
+        Note: log-likelihood computation always uses ``/v1/completions``
+        because ``/v1/chat/completions`` does not support ``echo``.
         """
         if not contexts:
             return []
@@ -325,29 +322,16 @@ class ServerEngine(InferenceEngine):
             cont = continuations[idx]
             full = ctx + cont
 
+            payload: dict[str, Any] = {
+                "model": self.model,
+                "prompt": full,
+                "max_tokens": 0,
+                "echo": True,
+                "logprobs": 1,
+                "temperature": 0.0,
+            }
             try:
-                ctx_data = self._post(
-                    "completions",
-                    {
-                        "model": self.model,
-                        "prompt": ctx,
-                        "max_tokens": 0,
-                        "echo": True,
-                        "logprobs": 0,
-                        "temperature": 0.0,
-                    },
-                )
-                full_data = self._post(
-                    "completions",
-                    {
-                        "model": self.model,
-                        "prompt": full,
-                        "max_tokens": 0,
-                        "echo": True,
-                        "logprobs": 0,
-                        "temperature": 0.0,
-                    },
-                )
+                data = self._post("completions", payload)
             except http_requests.HTTPError as exc:
                 if exc.response is not None and exc.response.status_code == 404:
                     if self._is_model_not_found(exc.response):
@@ -358,26 +342,41 @@ class ServerEngine(InferenceEngine):
                             f"Use --model with the served model name."
                         ) from exc
                     raise RuntimeError(
-                        "Log-likelihood computation requires "
-                        "/v1/completions with echo+logprobs support."
+                        "Log-likelihood computation requires the "
+                        "/v1/completions endpoint with echo+logprobs "
+                        "support.  Your server only exposes "
+                        "/v1/chat/completions which does not support "
+                        "this.  Use a server that exposes "
+                        "/v1/completions for loglikelihood-based tasks "
+                        "(hellaswag, mmlu, etc.), or switch to a "
+                        "generate_until-only task (gsm8k, etc.)."
                     ) from exc
                 raise
 
-            ctx_token_count = len(
-                ctx_data["choices"][0].get("logprobs", {}).get("tokens", [])
-            )
+            choice = data["choices"][0]
+            lp_data = choice.get("logprobs")
+            if not lp_data or not lp_data.get("token_logprobs"):
+                return idx, (0.0, False)
 
-            token_lps = (
-                full_data["choices"][0].get("logprobs", {}).get("token_logprobs", [])
-            )
+            tokens = lp_data["tokens"]
+            token_lps = lp_data["token_logprobs"]
+            top_lps = lp_data.get("top_logprobs")
+
+            ctx_token_count = self._find_context_boundary(tokens, token_lps, ctx, cont)
 
             total_ll = 0.0
+            is_greedy = True
             for i in range(ctx_token_count, len(token_lps)):
                 lp = token_lps[i]
-                if lp is not None:
-                    total_ll += lp
+                if lp is None:
+                    continue
+                total_ll += lp
+                if top_lps and i < len(top_lps) and top_lps[i]:
+                    best = max(top_lps[i].values())
+                    if abs(lp - best) > 1e-6:
+                        is_greedy = False
 
-            return idx, (total_ll, True)
+            return idx, (total_ll, is_greedy)
 
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as pool:
             futures = {pool.submit(_one, i): i for i in range(len(contexts))}
@@ -385,4 +384,22 @@ class ServerEngine(InferenceEngine):
                 idx, result = future.result()
                 results[idx] = result
 
-        return [r if r is not None else (0.0, True) for r in results]
+        return [r if r is not None else (0.0, False) for r in results]
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_context_boundary(
+        tokens: list[str],
+        token_logprobs: list[float | None],
+        context: str,
+        continuation: str,
+    ) -> int:
+        """Approximate the boundary between context and continuation tokens."""
+        accumulated = ""
+        ctx_len = len(context)
+        for i, tok in enumerate(tokens):
+            accumulated += tok
+            if len(accumulated) >= ctx_len:
+                return i + 1
+        return len(tokens)

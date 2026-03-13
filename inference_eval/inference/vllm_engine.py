@@ -126,11 +126,6 @@ class VLLMEngine(InferenceEngine):
         contexts: list[str],
         continuations: list[str],
     ) -> list[tuple[float, bool]]:
-        """Compute log-likelihoods using vLLM's prompt_logprobs.
-
-        ``is_greedy`` is always True for consistency across engines.
-        It does not affect acc / acc_norm / exact_match metrics.
-        """
         if not contexts:
             return []
 
@@ -145,17 +140,23 @@ class VLLMEngine(InferenceEngine):
         for output, ctx_len in zip(outputs, context_tok_lens):
             prompt_logprobs = output.prompt_logprobs
             if prompt_logprobs is None:
-                results.append((0.0, True))
+                results.append((0.0, False))
                 continue
 
             total_ll = 0.0
+            is_greedy = True
             for i in range(ctx_len, len(prompt_logprobs)):
                 token_lps = prompt_logprobs[i]
+                if token_lps is None:
+                    continue
                 if not token_lps:
                     continue
+                top_id = max(token_lps, key=lambda k: token_lps[k].logprob)
                 actual_id = next(iter(token_lps))
                 total_ll += token_lps[actual_id].logprob
+                if actual_id != top_id:
+                    is_greedy = False
 
-            results.append((total_ll, True))
+            results.append((total_ll, is_greedy))
 
         return results

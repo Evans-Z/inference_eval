@@ -97,11 +97,6 @@ class OpenAIEngine(InferenceEngine):
         contexts: list[str],
         continuations: list[str],
     ) -> list[tuple[float, bool]]:
-        """Compute log-likelihoods via the OpenAI completions API.
-
-        ``is_greedy`` is always True for consistency across engines.
-        It does not affect acc / acc_norm / exact_match metrics.
-        """
         if not contexts:
             return []
 
@@ -116,12 +111,12 @@ class OpenAIEngine(InferenceEngine):
                 prompt=full_text,
                 max_tokens=0,
                 echo=True,
-                logprobs=0,
+                logprobs=1,
             )
             choice = response.choices[0]
 
             if not (choice.logprobs and choice.logprobs.token_logprobs):
-                return idx, (0.0, True)
+                return idx, (0.0, False)
 
             tokens = choice.logprobs.tokens or []
             ctx_len = len(context)
@@ -136,7 +131,17 @@ class OpenAIEngine(InferenceEngine):
             cont_lps = choice.logprobs.token_logprobs[ctx_tokens:]
             total_ll = sum(lp for lp in cont_lps if lp is not None)
 
-            return idx, (total_ll, True)
+            top_lps = choice.logprobs.top_logprobs
+            is_greedy = True
+            if top_lps:
+                for i in range(ctx_tokens, len(choice.logprobs.token_logprobs)):
+                    if i < len(top_lps) and top_lps[i]:
+                        best = max(top_lps[i].values())
+                        actual = choice.logprobs.token_logprobs[i]
+                        if actual is not None and abs(actual - best) > 1e-6:
+                            is_greedy = False
+
+            return idx, (total_ll, is_greedy)
 
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as pool:
             futures = {pool.submit(_one, i): i for i in range(len(contexts))}
