@@ -171,12 +171,12 @@ def render_summary(
             m = primary.get(t)
             val = task_data.get(m) if m else None
             if val is not None:
-                row.append(f"{val * 100:.2f}" if val <= 1.0 else f"{val:.4f}")
+                row.append(f"{val:.4f}")
             else:
                 row.append("-")
         rows.append(row)
 
-    return tabulate(rows, headers=headers, tablefmt=fmt)
+    return tabulate(rows, headers=headers, tablefmt=fmt, disable_numparse=True)
 
 
 def render_detail(entry: dict[str, Any]) -> str:

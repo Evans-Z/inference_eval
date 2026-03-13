@@ -103,11 +103,10 @@ class TestRenderSummary:
         table = render_summary([])
         assert "no scoreboard entries" in table.lower()
 
-    def test_values_are_percentages(self):
+    def test_values_format(self):
         entries = [make_entry("m", _MOCK_EVAL_RESULTS)]
         table = render_summary(entries)
-        # 0.75 → displayed as 75 (percentage)
-        assert "75" in table
+        assert "0.7500" in table
 
 
 class TestSummaryCLI:
