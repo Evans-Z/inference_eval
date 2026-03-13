@@ -51,6 +51,8 @@ def extract_requests(
     """
     output_dir = Path(output_dir)
 
+    per_task = {t: {"num_fewshot": num_fewshot, "limit": limit} for t in tasks}
+
     config = ExtractConfig(
         tasks=tasks,
         num_fewshot=num_fewshot,
@@ -61,6 +63,7 @@ def extract_requests(
         fewshot_random_seed=fewshot_random_seed,
         apply_chat_template=apply_chat_template,
         system_instruction=system_instruction,
+        task_settings=per_task,
     )
 
     capture_lm = RequestCaptureLM()
@@ -82,8 +85,29 @@ def extract_requests(
     )
 
     logger.info("Captured %d total requests", len(capture_lm.captured_requests))
+
+    # Build the group → sub-task mapping.  lm-eval-harness expands task
+    # groups like "mmlu" into sub-tasks like "mmlu_abstract_algebra", etc.
+    extracted = sorted(set(r.task_name for r in capture_lm.captured_requests))
+    config.extracted_tasks = extracted
+
+    task_group_map: dict[str, list[str]] = {}
+    for user_task in tasks:
+        if user_task in extracted:
+            # Exact match — no expansion needed (e.g. "gsm8k")
+            continue
+        matching = [t for t in extracted if t.startswith(user_task + "_")]
+        if matching:
+            task_group_map[user_task] = matching
+            logger.info(
+                "Task group '%s' expanded to %d sub-tasks",
+                user_task,
+                len(matching),
+            )
+    config.task_group_map = task_group_map
+
     config.save(output_dir)
-    counts = save_requests(capture_lm.captured_requests, output_dir)
+    counts = save_requests(capture_lm.captured_requests, output_dir, task_group_map)
 
     for key, count in sorted(counts.items()):
         logger.info("  %s: %d requests", key, count)

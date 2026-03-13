@@ -17,6 +17,9 @@ def _setup_logging(verbosity: str) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Silence noisy third-party loggers that spam during inference
+    for name in ("urllib3", "requests", "httpx", "httpcore", "filelock"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 @click.group()
@@ -109,28 +112,81 @@ def extract(
 
 @cli.command()
 @click.option(
-    "--requests", "-r", required=True, help="Directory containing extracted requests"
+    "--requests",
+    "-r",
+    required=True,
+    help="Directory containing extracted requests",
 )
 @click.option(
-    "--output", "-o", required=True, help="Output directory for inference results"
+    "--output",
+    "-o",
+    required=True,
+    help="Output directory for inference results",
 )
 @click.option(
-    "--engine", "-e", required=True, help="Inference engine (vllm, sglang, openai)"
+    "--engine",
+    "-e",
+    required=True,
+    help="Inference engine: vllm, sglang, openai, server",
 )
 @click.option("--model", "-m", required=True, help="Model name or path")
 @click.option(
-    "--engine-args", type=str, default="{}", help="JSON string of engine kwargs"
+    "--base-url",
+    type=str,
+    default=None,
+    help="Server URL (for server/openai engine, e.g. http://localhost:8068/v1)",
 )
-@click.option("--batch-size", "-b", type=int, default=32, help="Batch size")
 @click.option(
-    "--tasks", "-t", type=str, default=None, help="Comma-separated task names to filter"
+    "--max-concurrent",
+    type=int,
+    default=None,
+    help="Max parallel requests (server/openai engine, default 64)",
 )
-@click.option("--verbosity", type=str, default="INFO", help="Logging verbosity")
+@click.option(
+    "--api-type",
+    type=click.Choice(["auto", "completions", "chat"]),
+    default=None,
+    help=(
+        "API endpoint type for server engine: "
+        "'completions' (/v1/completions), "
+        "'chat' (/v1/chat/completions), "
+        "or 'auto' (try completions, fall back to chat)"
+    ),
+)
+@click.option(
+    "--engine-args",
+    type=str,
+    default="{}",
+    help="JSON string of extra engine kwargs",
+)
+@click.option(
+    "--batch-size",
+    "-b",
+    type=int,
+    default=32,
+    help="Batch size for process_requests calls",
+)
+@click.option(
+    "--tasks",
+    "-t",
+    type=str,
+    default=None,
+    help="Comma-separated task names to filter",
+)
+@click.option(
+    "--verbosity",
+    type=str,
+    default="INFO",
+    help="Logging verbosity",
+)
 def infer(
     requests: str,
     output: str,
     engine: str,
     model: str,
+    base_url: str | None,
+    max_concurrent: int | None,
+    api_type: str | None,
     engine_args: str,
     batch_size: int,
     tasks: str | None,
@@ -138,14 +194,33 @@ def infer(
 ) -> None:
     """Run inference on extracted requests using a specified engine.
 
-    Reads requests from the extract output, runs them through the
-    inference engine, and saves results for evaluation.
+    \b
+    Examples:
+      # Local vLLM (batched)
+      inference-eval infer -r ./requests -o ./results \\
+          -e vllm -m meta-llama/Llama-3-8B-Instruct
+    \b
+      # Running vLLM / SGLang server (auto-detect API)
+      inference-eval infer -r ./requests -o ./results \\
+          -e server -m Qwen3-8B \\
+          --base-url http://localhost:8068/v1 --max-concurrent 64
+    \b
+      # Force chat completions endpoint
+      inference-eval infer -r ./requests -o ./results \\
+          -e server -m Qwen3-8B \\
+          --base-url http://localhost:8068/v1 --api-type chat
     """
     _setup_logging(verbosity)
     from inference_eval.infer import run_inference
 
     kwargs = json.loads(engine_args)
     kwargs["model"] = model
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    if max_concurrent is not None:
+        kwargs["max_concurrent"] = max_concurrent
+    if api_type is not None:
+        kwargs["api_type"] = api_type
 
     task_list = [t.strip() for t in tasks.split(",")] if tasks else None
 
@@ -203,6 +278,18 @@ def infer(
     help="Allow execution of unsafe task code",
 )
 @click.option("--log-samples", is_flag=True, help="Log individual sample results")
+@click.option(
+    "--tag",
+    type=str,
+    default=None,
+    help="Tag for this run (e.g. 'qwen3-8b-fp16'). Appends to scoreboard.",
+)
+@click.option(
+    "--scoreboard",
+    type=str,
+    default=None,
+    help="Path to scoreboard JSONL (default: scoreboard.jsonl)",
+)
 @click.option("--verbosity", type=str, default="INFO", help="Logging verbosity")
 def evaluate(
     results: str,
@@ -213,12 +300,22 @@ def evaluate(
     limit: float | None,
     confirm_run_unsafe_code: bool,
     log_samples: bool,
+    tag: str | None,
+    scoreboard: str | None,
     verbosity: str,
 ) -> None:
     """Evaluate inference results using lm-eval-harness metrics.
 
+    \b
     Feeds pre-computed results back to lm-eval-harness for metric
     computation and displays scores.
+    \b
+    Use --tag to record results in a scoreboard for cross-model comparison:
+      inference-eval evaluate -r ./results/qwen3 --requests ./requests \\
+          --tag qwen3-8b-fp16
+      inference-eval evaluate -r ./results/llama3 --requests ./requests \\
+          --tag llama3-8b-int4
+      inference-eval summary   # view comparison table
     """
     _setup_logging(verbosity)
     from inference_eval.evaluate import evaluate_results
@@ -236,6 +333,8 @@ def evaluate(
         confirm_run_unsafe_code=confirm_run_unsafe_code,
         log_samples=log_samples,
         verbosity=verbosity,
+        tag=tag,
+        scoreboard=scoreboard,
     )
 
 
@@ -271,6 +370,98 @@ def convert(
     click.echo(f"\nConverted results saved to {output}:")
     for key, count in sorted(counts.items()):
         click.echo(f"  {key}: {count} results")
+
+
+@cli.command()
+@click.option(
+    "--scoreboard",
+    "-s",
+    type=str,
+    default=None,
+    help="Path to scoreboard JSONL (default: scoreboard.jsonl)",
+)
+@click.option(
+    "--tasks",
+    "-t",
+    type=str,
+    default=None,
+    help="Comma-separated task names to show (default: all)",
+)
+@click.option(
+    "--metric",
+    "-m",
+    type=str,
+    default=None,
+    help="Force this metric for all tasks (default: auto-pick)",
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=str,
+    default="simple_grid",
+    help="Table format (any tabulate format, e.g. github, grid, pipe)",
+)
+@click.option(
+    "--tag",
+    type=str,
+    default=None,
+    help="Show only entries matching this tag",
+)
+@click.option(
+    "--csv",
+    "csv_file",
+    type=str,
+    default=None,
+    help="Export to CSV file",
+)
+def summary(
+    scoreboard: str | None,
+    tasks: str | None,
+    metric: str | None,
+    fmt: str,
+    tag: str | None,
+    csv_file: str | None,
+) -> None:
+    """Display a comparison table of all evaluated models.
+
+    \b
+    Reads the scoreboard built up by 'evaluate --tag' calls:
+      inference-eval summary
+      inference-eval summary --tasks gsm8k,mmlu
+      inference-eval summary --csv results.csv
+      inference-eval summary --format github
+
+    \b
+    A CSV file (scoreboard.csv) is also auto-generated alongside
+    the JSONL file every time 'evaluate --tag' is run, so you can
+    always open it in Excel / Google Sheets.
+    """
+    from inference_eval.scoreboard import (
+        DEFAULT_SCOREBOARD,
+        export_csv_string,
+        load_entries,
+        render_summary,
+    )
+
+    sb_path = scoreboard or DEFAULT_SCOREBOARD
+    entries = load_entries(sb_path)
+    if not entries:
+        click.echo(f"No entries found in {sb_path}")
+        return
+
+    if tag:
+        entries = [e for e in entries if e.get("tag") == tag]
+
+    task_list = [t.strip() for t in tasks.split(",")] if tasks else None
+
+    table = render_summary(entries, tasks=task_list, metric=metric, fmt=fmt)
+    click.echo(table)
+
+    if csv_file:
+        csv_content = export_csv_string(entries, tasks=task_list, metric=metric)
+        with open(csv_file, "w", newline="") as f:
+            f.write(csv_content)
+        click.echo(f"\nExported to {csv_file}")
 
 
 if __name__ == "__main__":

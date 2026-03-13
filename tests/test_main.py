@@ -39,3 +39,14 @@ def test_evaluate_help():
     result = runner.invoke(cli, ["evaluate", "--help"])
     assert result.exit_code == 0
     assert "--results" in result.output
+
+
+def test_infer_help():
+    runner = CliRunner()
+    result = runner.invoke(cli, ["infer", "--help"])
+    assert result.exit_code == 0
+    assert "--base-url" in result.output
+    assert "--max-concurrent" in result.output
+    assert "--api-type" in result.output
+    assert "--engine" in result.output
+    assert "server" in result.output

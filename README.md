@@ -39,7 +39,7 @@ This saves task prompts as JSONL files in `./requests/<task_name>/<request_type>
 
 ### Step 2: Run inference
 
-**Using a built-in engine:**
+**Using local vLLM (batched — all prompts processed in one call):**
 ```bash
 inference-eval infer \
     --requests ./requests \
@@ -47,6 +47,20 @@ inference-eval infer \
     --engine vllm \
     --model meta-llama/Llama-3-8B-Instruct \
     --engine-args '{"tensor_parallel_size": 4}'
+```
+
+**Using a running vLLM / SGLang server (concurrent HTTP requests):**
+```bash
+# Start your server first, e.g.:
+#   vllm serve meta-llama/Llama-3-8B-Instruct --port 8068
+
+inference-eval infer \
+    --requests ./requests \
+    --output ./results \
+    --engine server \
+    --model meta-llama/Llama-3-8B-Instruct \
+    --base-url http://localhost:8068/v1 \
+    --max-concurrent 64
 ```
 
 **Using a custom script:**
