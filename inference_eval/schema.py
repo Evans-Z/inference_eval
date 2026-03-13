@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ExtractConfig:
-    """Configuration saved during extraction for reproducible evaluation."""
+    """Configuration saved during extraction for reproducible evaluation.
 
-    tasks: list[str]
+    Supports incremental extraction: calling :meth:`save` on a directory
+    that already contains a ``config.json`` will **merge** the new tasks
+    into the existing config rather than overwriting it.
+    """
+
+    tasks: list[str] = field(default_factory=list)
     num_fewshot: int | None = None
     limit: int | float | None = None
     random_seed: int = 0
@@ -26,15 +34,73 @@ class ExtractConfig:
     extracted_tasks: list[str] = field(default_factory=list)
 
     def save(self, output_dir: Path) -> None:
+        """Save config, merging with any existing config in the directory."""
         output_dir.mkdir(parents=True, exist_ok=True)
-        with open(output_dir / "config.json", "w") as f:
+        config_path = output_dir / "config.json"
+
+        if config_path.exists():
+            try:
+                existing = ExtractConfig.load(output_dir)
+                self._merge_from(existing)
+                logger.info(
+                    "Merged with existing config (%d previous tasks)",
+                    len(existing.tasks),
+                )
+            except Exception:
+                logger.warning("Could not read existing config.json; overwriting.")
+
+        with open(config_path, "w") as f:
             json.dump(asdict(self), f, indent=2)
+
+    def _merge_from(self, existing: ExtractConfig) -> None:
+        """Merge *existing* config into self (self = latest extraction)."""
+        self.tasks = _dedup_ordered(existing.tasks + self.tasks)
+
+        merged_map = dict(existing.task_group_map)
+        merged_map.update(self.task_group_map)
+        self.task_group_map = merged_map
+
+        self.extracted_tasks = _dedup_ordered(
+            existing.extracted_tasks + self.extracted_tasks
+        )
 
     @classmethod
     def load(cls, input_dir: Path) -> ExtractConfig:
         with open(input_dir / "config.json") as f:
             data = json.load(f)
         return cls(**data)
+
+
+def _dedup_ordered(seq: list[str]) -> list[str]:
+    """Remove duplicates while preserving insertion order."""
+    return list(dict.fromkeys(seq))
+
+
+# ------------------------------------------------------------------
+# Directory helpers — task groups nest under their parent folder
+# ------------------------------------------------------------------
+
+
+def _task_dir(
+    base: Path,
+    task_name: str,
+    task_group_map: dict[str, list[str]],
+) -> Path:
+    """Return the on-disk directory for *task_name*.
+
+    If the task belongs to a group (e.g. ``mmlu_anatomy`` is part of
+    the ``mmlu`` group), the path is ``base / mmlu / mmlu_anatomy``.
+    Otherwise it is simply ``base / task_name``.
+    """
+    for group, subtasks in task_group_map.items():
+        if task_name in subtasks:
+            return base / group / task_name
+    return base / task_name
+
+
+# ------------------------------------------------------------------
+# Request / Result data models
+# ------------------------------------------------------------------
 
 
 @dataclass
@@ -86,9 +152,19 @@ class TaskRequests:
     requests: dict[str, list[InferenceRequest]] = field(default_factory=dict)
 
 
-def save_requests(requests: list[InferenceRequest], output_dir: Path) -> dict[str, int]:
+# ------------------------------------------------------------------
+# Save / load
+# ------------------------------------------------------------------
+
+
+def save_requests(
+    requests: list[InferenceRequest],
+    output_dir: Path,
+    task_group_map: dict[str, list[str]] | None = None,
+) -> dict[str, int]:
     """Save requests to disk organized by task/request_type. Returns counts."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    gmap = task_group_map or {}
     counts: dict[str, int] = {}
 
     groups: dict[tuple[str, str], list[InferenceRequest]] = {}
@@ -97,9 +173,9 @@ def save_requests(requests: list[InferenceRequest], output_dir: Path) -> dict[st
         groups.setdefault(key, []).append(req)
 
     for (task_name, req_type), reqs in groups.items():
-        task_dir = output_dir / task_name
-        task_dir.mkdir(parents=True, exist_ok=True)
-        filepath = task_dir / f"{req_type}.jsonl"
+        tdir = _task_dir(output_dir, task_name, gmap)
+        tdir.mkdir(parents=True, exist_ok=True)
+        filepath = tdir / f"{req_type}.jsonl"
         with open(filepath, "w") as f:
             for req in reqs:
                 f.write(json.dumps(asdict(req)) + "\n")
@@ -109,7 +185,7 @@ def save_requests(requests: list[InferenceRequest], output_dir: Path) -> dict[st
 
 
 def load_requests(input_dir: Path) -> list[InferenceRequest]:
-    """Load all requests from disk."""
+    """Load all requests from disk (works with flat or nested layout)."""
     requests = []
     for jsonl_path in sorted(input_dir.rglob("*.jsonl")):
         with open(jsonl_path) as f:
@@ -120,9 +196,14 @@ def load_requests(input_dir: Path) -> list[InferenceRequest]:
     return requests
 
 
-def save_results(results: list[InferenceResult], output_dir: Path) -> dict[str, int]:
+def save_results(
+    results: list[InferenceResult],
+    output_dir: Path,
+    task_group_map: dict[str, list[str]] | None = None,
+) -> dict[str, int]:
     """Save results to disk organized by task/request_type. Returns counts."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    gmap = task_group_map or {}
     counts: dict[str, int] = {}
 
     groups: dict[tuple[str, str], list[InferenceResult]] = {}
@@ -131,9 +212,9 @@ def save_results(results: list[InferenceResult], output_dir: Path) -> dict[str, 
         groups.setdefault(key, []).append(res)
 
     for (task_name, req_type), res_list in groups.items():
-        task_dir = output_dir / task_name
-        task_dir.mkdir(parents=True, exist_ok=True)
-        filepath = task_dir / f"{req_type}.jsonl"
+        tdir = _task_dir(output_dir, task_name, gmap)
+        tdir.mkdir(parents=True, exist_ok=True)
+        filepath = tdir / f"{req_type}.jsonl"
         with open(filepath, "w") as f:
             for res in res_list:
                 f.write(json.dumps(asdict(res)) + "\n")
@@ -143,7 +224,7 @@ def save_results(results: list[InferenceResult], output_dir: Path) -> dict[str, 
 
 
 def load_results(input_dir: Path) -> list[InferenceResult]:
-    """Load all results from disk."""
+    """Load all results from disk (works with flat or nested layout)."""
     results = []
     for jsonl_path in sorted(input_dir.rglob("*.jsonl")):
         with open(jsonl_path) as f:

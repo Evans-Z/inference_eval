@@ -146,6 +146,16 @@ def run_inference(
     if isinstance(engine, str):
         engine = get_engine(engine, engine_kwargs or {})
 
+    # Load group map so results mirror the nested request directory layout
+    group_map: dict[str, list[str]] = {}
+    config_path = requests_dir / "config.json"
+    if config_path.exists():
+        try:
+            cfg = ExtractConfig.load(requests_dir)
+            group_map = cfg.task_group_map
+        except Exception:
+            pass
+
     all_requests = load_requests(requests_dir)
     if tasks:
         all_requests = _filter_by_tasks(all_requests, tasks, requests_dir)
@@ -164,7 +174,7 @@ def run_inference(
         batch_results = engine.process_requests(batch)
         all_results.extend(batch_results)
 
-    counts = save_results(all_results, output_dir)
+    counts = save_results(all_results, output_dir, group_map)
     logger.info("Saved %d results", len(all_results))
     return counts
 

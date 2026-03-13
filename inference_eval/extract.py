@@ -104,7 +104,7 @@ def extract_requests(
     config.task_group_map = task_group_map
 
     config.save(output_dir)
-    counts = save_requests(capture_lm.captured_requests, output_dir)
+    counts = save_requests(capture_lm.captured_requests, output_dir, task_group_map)
 
     for key, count in sorted(counts.items()):
         logger.info("  %s: %d requests", key, count)
