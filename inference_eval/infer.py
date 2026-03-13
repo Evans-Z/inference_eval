@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
+
+from tqdm import tqdm
 
 from inference_eval.inference.base import InferenceEngine
 from inference_eval.schema import (
@@ -160,16 +163,28 @@ def run_inference(
     if tasks:
         all_requests = _filter_by_tasks(all_requests, tasks, requests_dir)
 
-    logger.info("Running inference on %d requests", len(all_requests))
+    total = len(all_requests)
+    logger.info("Running inference on %d requests", total)
+    t0 = time.perf_counter()
 
     all_results = []
-    for i in range(0, len(all_requests), batch_size):
-        batch = all_requests[i : i + batch_size]
-        batch_results = engine.process_requests(batch)
-        all_results.extend(batch_results)
+    with tqdm(total=total, desc="Inference", unit="req") as pbar:
+        for i in range(0, total, batch_size):
+            batch = all_requests[i : i + batch_size]
+            batch_results = engine.process_requests(batch)
+            all_results.extend(batch_results)
+            pbar.update(len(batch))
+
+    elapsed = time.perf_counter() - t0
+    logger.info(
+        "Done: %d results in %.1fs (%.1f req/s). Saved to %s",
+        len(all_results),
+        elapsed,
+        total / max(elapsed, 0.001),
+        output_dir,
+    )
 
     counts = save_results(all_results, output_dir, group_map)
-    logger.info("Saved %d results to %s", len(all_results), output_dir)
     return counts
 
 

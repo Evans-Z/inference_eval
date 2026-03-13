@@ -8,13 +8,11 @@ dependencies beyond ``requests`` (already a transitive dep of lm-eval).
 from __future__ import annotations
 
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import requests as http_requests
 from requests.adapters import HTTPAdapter
-from tqdm import tqdm
 
 from inference_eval.inference.base import InferenceEngine
 
@@ -280,7 +278,6 @@ class ServerEngine(InferenceEngine):
 
         api = self._resolve_api_type()
         results: list[str | None] = [None] * len(prompts)
-        t0 = time.perf_counter()
 
         def _one(idx: int) -> tuple[int, str]:
             kw = gen_kwargs[idx]
@@ -292,19 +289,10 @@ class ServerEngine(InferenceEngine):
 
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as pool:
             futures = {pool.submit(_one, i): i for i in range(len(prompts))}
-            with tqdm(total=len(prompts), desc="generate", unit="req") as pbar:
-                for future in as_completed(futures):
-                    idx, text = future.result()
-                    results[idx] = text
-                    pbar.update(1)
+            for future in as_completed(futures):
+                idx, text = future.result()
+                results[idx] = text
 
-        elapsed = time.perf_counter() - t0
-        logger.info(
-            "generate: %d prompts in %.1fs (%.1f req/s)",
-            len(prompts),
-            elapsed,
-            len(prompts) / max(elapsed, 0.001),
-        )
         return [r if r is not None else "" for r in results]
 
     # ------------------------------------------------------------------
@@ -328,7 +316,6 @@ class ServerEngine(InferenceEngine):
             return []
 
         results: list[tuple[float, bool] | None] = [None] * len(contexts)
-        t0 = time.perf_counter()
 
         def _one(idx: int) -> tuple[int, tuple[float, bool]]:
             ctx = contexts[idx]
@@ -393,19 +380,10 @@ class ServerEngine(InferenceEngine):
 
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as pool:
             futures = {pool.submit(_one, i): i for i in range(len(contexts))}
-            with tqdm(total=len(contexts), desc="loglikelihood", unit="req") as pbar:
-                for future in as_completed(futures):
-                    idx, result = future.result()
-                    results[idx] = result
-                    pbar.update(1)
+            for future in as_completed(futures):
+                idx, result = future.result()
+                results[idx] = result
 
-        elapsed = time.perf_counter() - t0
-        logger.info(
-            "loglikelihood: %d items in %.1fs (%.1f req/s)",
-            len(contexts),
-            elapsed,
-            len(contexts) / max(elapsed, 0.001),
-        )
         return [r if r is not None else (0.0, False) for r in results]
 
     # ------------------------------------------------------------------

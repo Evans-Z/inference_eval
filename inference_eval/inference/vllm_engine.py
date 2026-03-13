@@ -88,7 +88,7 @@ class VLLMEngine(InferenceEngine):
         )
 
     # ------------------------------------------------------------------
-    # generate  (batched)
+    # generate  (batched, quiet — progress is tracked by run_inference)
     # ------------------------------------------------------------------
 
     def generate(
@@ -99,8 +99,6 @@ class VLLMEngine(InferenceEngine):
         if not prompts:
             return []
 
-        # Group prompts that share the same SamplingParams so vLLM can
-        # schedule them as one batch.
         groups: dict[str, tuple[list[int], list[str], dict]] = {}
         for idx, (prompt, kw) in enumerate(zip(prompts, gen_kwargs)):
             key = self._kwargs_key(kw)
@@ -111,21 +109,16 @@ class VLLMEngine(InferenceEngine):
 
         results: list[str | None] = [None] * len(prompts)
 
-        for key, (indices, group_prompts, kw) in groups.items():
+        for _key, (indices, group_prompts, kw) in groups.items():
             params = self._make_sampling_params(kw)
-            logger.info(
-                "vLLM batch-generate: %d prompts (params=%s)",
-                len(group_prompts),
-                key[:120],
-            )
-            outputs = self.llm.generate(group_prompts, params)
+            outputs = self.llm.generate(group_prompts, params, use_tqdm=False)
             for orig_idx, out in zip(indices, outputs):
                 results[orig_idx] = out.outputs[0].text
 
         return [r if r is not None else "" for r in results]
 
     # ------------------------------------------------------------------
-    # loglikelihood  (batched)
+    # loglikelihood  (batched, quiet)
     # ------------------------------------------------------------------
 
     def compute_loglikelihood(
@@ -141,9 +134,7 @@ class VLLMEngine(InferenceEngine):
         context_tok_lens = [len(tokenizer.encode(ctx)) for ctx in contexts]
 
         params = self._make_sampling_params({}, for_logprobs=True)
-
-        logger.info("vLLM batch-loglikelihood: %d prompts", len(full_texts))
-        outputs = self.llm.generate(full_texts, params)
+        outputs = self.llm.generate(full_texts, params, use_tqdm=False)
 
         results: list[tuple[float, bool]] = []
         for output, ctx_len in zip(outputs, context_tok_lens):
