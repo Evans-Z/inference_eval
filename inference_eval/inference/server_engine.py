@@ -31,9 +31,14 @@ class ServerEngine(InferenceEngine):
     * ``python -m sglang.launch_server --port 8068``
     * Any OpenAI-compatible endpoint
 
+    **Important**: ``model`` must be the *served* model name as the
+    server knows it — not the local file path.  Run
+    ``curl http://localhost:<port>/v1/models`` to see available names.
+
     Args:
-        model: Model name the server is hosting (passed as ``model``
-            field in every request).
+        model: Served model name (e.g. ``"qwen3"``).  This is the name
+            returned by ``/v1/models``, which may differ from the local
+            path used to start the server.
         base_url: Root URL of the server's OpenAI-compatible API,
             e.g. ``http://localhost:8068/v1``.  A trailing ``/v1``
             is appended automatically if absent.
@@ -43,8 +48,10 @@ class ServerEngine(InferenceEngine):
         api_type: Which endpoint to use.
 
             * ``"auto"`` (default) — tries ``/v1/completions`` first;
-              if the server returns 404 falls back to
+              if the server returns a *route-level* 404 falls back to
               ``/v1/chat/completions`` for the rest of the session.
+              A *model-not-found* 404 is treated as an error (not a
+              fallback trigger).
             * ``"completions"`` — always use ``/v1/completions``.
             * ``"chat"`` — always use ``/v1/chat/completions``.
               Prompts are sent as a single ``user`` message.
@@ -81,12 +88,56 @@ class ServerEngine(InferenceEngine):
                 "Content-Type": "application/json",
             }
         )
+
+        # Validate model name against server early so the user gets a
+        # clear error before processing thousands of requests.
+        self._validate_model_name()
+
         logger.info(
             "ServerEngine: model=%s  url=%s  concurrency=%d  api_type=%s",
-            model,
+            self.model,
             self.base_url,
             max_concurrent,
             api_type,
+        )
+
+    # ------------------------------------------------------------------
+    # model-name validation
+    # ------------------------------------------------------------------
+
+    def _list_models(self) -> list[str]:
+        """Query ``GET /v1/models`` and return available model ids."""
+        url = f"{self.base_url}/models"
+        resp = self._session.get(url, timeout=min(self.timeout, 15))
+        resp.raise_for_status()
+        data = resp.json()
+        return [m["id"] for m in data.get("data", [])]
+
+    def _validate_model_name(self) -> None:
+        """Check model name against /v1/models; fail fast if wrong."""
+        try:
+            available = self._list_models()
+        except Exception:
+            logger.debug(
+                "Could not query /v1/models for validation (server "
+                "may not support it) — skipping model-name check."
+            )
+            return
+
+        if not available:
+            return
+
+        if self.model in available:
+            logger.info("Model '%s' confirmed available on server.", self.model)
+            return
+
+        raise ValueError(
+            f"Model '{self.model}' was not found on the server at "
+            f"{self.base_url}.\n"
+            f"Available model(s): {available}\n"
+            f"Hint: --model should be the *served* model name "
+            f"(as shown by /v1/models), not the local file path.\n"
+            f"Try:  --model {available[0]}"
         )
 
     # ------------------------------------------------------------------
@@ -100,8 +151,45 @@ class ServerEngine(InferenceEngine):
         resp.raise_for_status()
         return resp.json()
 
+    @staticmethod
+    def _is_model_not_found(resp: http_requests.Response) -> bool:
+        """Return True if a 404 response is a model-name error.
+
+        vLLM returns JSON like::
+
+            {"message": "The model `X` does not exist.",
+             "type": "NotFoundError", "param": "model", "code": 404}
+
+        A *route-level* 404 typically returns HTML or an empty body.
+        """
+        try:
+            body = resp.json()
+        except Exception:
+            return False
+
+        # vLLM / OpenAI nested {"error": {...}} format
+        err = body.get("error", body)
+        if isinstance(err, dict):
+            if err.get("param") == "model":
+                return True
+            msg = str(err.get("message", ""))
+            if "does not exist" in msg.lower():
+                return True
+
+        msg_top = str(body.get("message", ""))
+        if "does not exist" in msg_top.lower():
+            return True
+
+        return False
+
     def _resolve_api_type(self) -> str:
-        """Auto-detect whether the server supports completions or chat."""
+        """Auto-detect whether the server supports completions or chat.
+
+        Sends a tiny probe to ``/v1/completions``.  If the 404 is due
+        to the *endpoint* not existing we fall back to chat.  If it is
+        due to a wrong *model name* we raise immediately — falling back
+        would hit the same error.
+        """
         if self._resolved_type is not None:
             return self._resolved_type
 
@@ -121,15 +209,34 @@ class ServerEngine(InferenceEngine):
                     "(server supports /v1/completions)"
                 )
                 return "completions"
+
+            # Got 404 — is it a model-name error or a missing route?
+            if self._is_model_not_found(resp):
+                available = self._try_list_models_safe()
+                raise ValueError(
+                    f"Server returned 'model not found' for "
+                    f"model='{self.model}'.  The /v1/completions "
+                    f"endpoint exists but the model name is wrong.\n"
+                    f"Available model(s): {available}\n"
+                    f"Hint: --model should be the *served* model name, "
+                    f"not the local file path."
+                )
+
         except http_requests.RequestException:
             pass
 
         self._resolved_type = "chat"
         logger.info(
             "Auto-detected api_type='chat' "
-            "(/v1/completions returned 404, using /v1/chat/completions)"
+            "(/v1/completions not available, using /v1/chat/completions)"
         )
         return "chat"
+
+    def _try_list_models_safe(self) -> list[str]:
+        try:
+            return self._list_models()
+        except Exception:
+            return ["(could not query /v1/models)"]
 
     # ------------------------------------------------------------------
     # unified request helpers
@@ -252,15 +359,22 @@ class ServerEngine(InferenceEngine):
                 data = self._post("completions", payload)
             except http_requests.HTTPError as exc:
                 if exc.response is not None and exc.response.status_code == 404:
+                    if self._is_model_not_found(exc.response):
+                        available = self._try_list_models_safe()
+                        raise ValueError(
+                            f"Model '{self.model}' not found. "
+                            f"Available: {available}. "
+                            f"Use --model with the served model name."
+                        ) from exc
                     raise RuntimeError(
                         "Log-likelihood computation requires the "
                         "/v1/completions endpoint with echo+logprobs "
                         "support.  Your server only exposes "
                         "/v1/chat/completions which does not support "
-                        "this.  Use a server that exposes /v1/completions "
-                        "for loglikelihood-based tasks (hellaswag, mmlu, "
-                        "etc.), or switch to a generate_until-only task "
-                        "(gsm8k, etc.)."
+                        "this.  Use a server that exposes "
+                        "/v1/completions for loglikelihood-based tasks "
+                        "(hellaswag, mmlu, etc.), or switch to a "
+                        "generate_until-only task (gsm8k, etc.)."
                     ) from exc
                 raise
 

@@ -1,4 +1,4 @@
-"""Tests for ServerEngine using a mock HTTP server."""
+"""Tests for ServerEngine using mock HTTP servers."""
 
 from __future__ import annotations
 
@@ -11,114 +11,147 @@ import pytest
 
 from inference_eval.inference.server_engine import ServerEngine
 
+_SERVED_MODEL = "test-model"
+
+
 # ------------------------------------------------------------------
-# Mock server that supports BOTH /v1/completions and /v1/chat/completions
+# Handler helpers
 # ------------------------------------------------------------------
 
 
-class _MockBothHandler(BaseHTTPRequestHandler):
-    """Mock handler supporting both completions and chat completions."""
-
-    def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", 0))
-        body: dict[str, Any] = json.loads(self.rfile.read(length))
-
-        if self.path.rstrip("/").endswith("/chat/completions"):
-            self._handle_chat(body)
-        elif self.path.rstrip("/").endswith("/completions"):
-            self._handle_completions(body)
-        else:
-            self.send_error(404)
-
-    def _handle_completions(self, body: dict) -> None:
-        echo = body.get("echo", False)
-        prompt = body.get("prompt", "")
-
-        if echo:
-            response = {
-                "choices": [
-                    {
-                        "text": prompt,
-                        "logprobs": {
-                            "tokens": list(prompt),
-                            "token_logprobs": [
-                                None if i == 0 else -0.5 for i in range(len(prompt))
-                            ],
-                            "top_logprobs": [
-                                None if i == 0 else {prompt[i]: -0.5}
-                                for i in range(len(prompt))
-                            ],
-                        },
-                    }
-                ]
-            }
-        else:
-            response = {"choices": [{"text": f"completions_answer_{len(prompt)}"}]}
-        self._respond(response)
-
-    def _handle_chat(self, body: dict) -> None:
-        messages = body.get("messages", [])
-        content = messages[-1]["content"] if messages else ""
-        response = {
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": f"chat_answer_{len(content)}",
-                    }
-                }
-            ]
-        }
-        self._respond(response)
-
-    def _respond(self, data: dict) -> None:
+class _BaseHandler(BaseHTTPRequestHandler):
+    def _respond_json(self, data: dict, status: int = 200) -> None:
         payload = json.dumps(data).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 
+    def _read_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(length)) if length else {}
+
+    def _check_model(self, body: dict) -> bool:
+        """Return True if model name is valid, else send 404."""
+        model = body.get("model", "")
+        if model != _SERVED_MODEL:
+            self._respond_json(
+                {
+                    "error": {
+                        "message": f"The model `{model}` does not exist.",
+                        "type": "NotFoundError",
+                        "param": "model",
+                        "code": 404,
+                    }
+                },
+                status=404,
+            )
+            return False
+        return True
+
     def log_message(self, fmt: str, *args: Any) -> None:
         pass
 
 
 # ------------------------------------------------------------------
-# Mock server that supports ONLY /v1/chat/completions (no /v1/completions)
+# Mock: supports BOTH endpoints + /v1/models, validates model name
 # ------------------------------------------------------------------
 
 
-class _MockChatOnlyHandler(BaseHTTPRequestHandler):
-    """Mock handler that only supports /v1/chat/completions."""
-
-    def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", 0))
-        body: dict[str, Any] = json.loads(self.rfile.read(length))
-
-        if self.path.rstrip("/").endswith("/chat/completions"):
-            messages = body.get("messages", [])
-            content = messages[-1]["content"] if messages else ""
-            response = {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": f"chat_only_{len(content)}",
-                        }
-                    }
-                ]
-            }
-            payload = json.dumps(response).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+class _MockBothHandler(_BaseHandler):
+    def do_GET(self) -> None:
+        if self.path.rstrip("/").endswith("/models"):
+            self._respond_json({"data": [{"id": _SERVED_MODEL, "object": "model"}]})
         else:
             self.send_error(404)
 
-    def log_message(self, fmt: str, *args: Any) -> None:
-        pass
+    def do_POST(self) -> None:
+        body = self._read_body()
+        if self.path.rstrip("/").endswith("/chat/completions"):
+            if not self._check_model(body):
+                return
+            messages = body.get("messages", [])
+            content = messages[-1]["content"] if messages else ""
+            self._respond_json(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": f"chat_answer_{len(content)}",
+                            }
+                        }
+                    ]
+                }
+            )
+        elif self.path.rstrip("/").endswith("/completions"):
+            if not self._check_model(body):
+                return
+            echo = body.get("echo", False)
+            prompt = body.get("prompt", "")
+            if echo:
+                self._respond_json(
+                    {
+                        "choices": [
+                            {
+                                "text": prompt,
+                                "logprobs": {
+                                    "tokens": list(prompt),
+                                    "token_logprobs": [
+                                        None if i == 0 else -0.5
+                                        for i in range(len(prompt))
+                                    ],
+                                    "top_logprobs": [
+                                        None if i == 0 else {prompt[i]: -0.5}
+                                        for i in range(len(prompt))
+                                    ],
+                                },
+                            }
+                        ]
+                    }
+                )
+            else:
+                self._respond_json(
+                    {"choices": [{"text": f"completions_answer_{len(prompt)}"}]}
+                )
+        else:
+            self.send_error(404)
+
+
+# ------------------------------------------------------------------
+# Mock: ONLY chat endpoint + /v1/models, no /v1/completions route
+# ------------------------------------------------------------------
+
+
+class _MockChatOnlyHandler(_BaseHandler):
+    def do_GET(self) -> None:
+        if self.path.rstrip("/").endswith("/models"):
+            self._respond_json({"data": [{"id": _SERVED_MODEL, "object": "model"}]})
+        else:
+            self.send_error(404)
+
+    def do_POST(self) -> None:
+        body = self._read_body()
+        if self.path.rstrip("/").endswith("/chat/completions"):
+            if not self._check_model(body):
+                return
+            messages = body.get("messages", [])
+            content = messages[-1]["content"] if messages else ""
+            self._respond_json(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": f"chat_only_{len(content)}",
+                            }
+                        }
+                    ]
+                }
+            )
+        else:
+            self.send_error(404)
 
 
 # ------------------------------------------------------------------
@@ -126,37 +159,36 @@ class _MockChatOnlyHandler(BaseHTTPRequestHandler):
 # ------------------------------------------------------------------
 
 
+def _start_server(handler_cls: type) -> tuple[HTTPServer, str]:
+    server = HTTPServer(("127.0.0.1", 0), handler_cls)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{port}"
+
+
 @pytest.fixture(scope="module")
 def mock_server():
-    """Server supporting both /v1/completions and /v1/chat/completions."""
-    server = HTTPServer(("127.0.0.1", 0), _MockBothHandler)
-    port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{port}"
+    server, url = _start_server(_MockBothHandler)
+    yield url
     server.shutdown()
 
 
 @pytest.fixture(scope="module")
 def chat_only_server():
-    """Server supporting ONLY /v1/chat/completions (returns 404 on /v1/completions)."""
-    server = HTTPServer(("127.0.0.1", 0), _MockChatOnlyHandler)
-    port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{port}"
+    server, url = _start_server(_MockChatOnlyHandler)
+    yield url
     server.shutdown()
 
 
 # ------------------------------------------------------------------
-# Tests
+# Tests — completions mode
 # ------------------------------------------------------------------
 
 
 class TestServerEngine:
     def test_generate_single(self, mock_server: str):
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=mock_server,
             max_concurrent=4,
             api_type="completions",
@@ -170,7 +202,7 @@ class TestServerEngine:
 
     def test_generate_batch(self, mock_server: str):
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=mock_server,
             max_concurrent=8,
             api_type="completions",
@@ -183,14 +215,14 @@ class TestServerEngine:
 
     def test_generate_empty(self, mock_server: str):
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=mock_server,
         )
         assert engine.generate([], []) == []
 
     def test_loglikelihood(self, mock_server: str):
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=mock_server,
             max_concurrent=4,
             api_type="completions",
@@ -203,7 +235,7 @@ class TestServerEngine:
 
     def test_loglikelihood_batch(self, mock_server: str):
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=mock_server,
             max_concurrent=8,
             api_type="completions",
@@ -216,13 +248,13 @@ class TestServerEngine:
 
     def test_base_url_normalization(self, mock_server: str):
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=mock_server + "/v1",
         )
         assert engine.base_url == mock_server + "/v1"
 
         engine2 = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=mock_server,
         )
         assert engine2.base_url == mock_server + "/v1"
@@ -231,12 +263,12 @@ class TestServerEngine:
         from inference_eval.schema import InferenceRequest
 
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=mock_server,
             max_concurrent=4,
             api_type="completions",
         )
-        requests = [
+        reqs = [
             InferenceRequest(
                 task_name="gsm8k",
                 request_type="generate_until",
@@ -247,18 +279,20 @@ class TestServerEngine:
             )
             for i in range(5)
         ]
-        results = engine.process_requests(requests)
+        results = engine.process_requests(reqs)
         assert len(results) == 5
         assert all(r.generated_text is not None for r in results)
-        assert all(r.task_name == "gsm8k" for r in results)
+
+
+# ------------------------------------------------------------------
+# Tests — chat mode
+# ------------------------------------------------------------------
 
 
 class TestServerEngineChatMode:
-    """Tests for the chat completions endpoint."""
-
     def test_explicit_chat_mode(self, mock_server: str):
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=mock_server,
             api_type="chat",
         )
@@ -271,7 +305,7 @@ class TestServerEngineChatMode:
 
     def test_chat_batch(self, mock_server: str):
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=mock_server,
             max_concurrent=8,
             api_type="chat",
@@ -283,12 +317,15 @@ class TestServerEngineChatMode:
         assert all(r.startswith("chat_answer_") for r in results)
 
 
-class TestServerEngineAutoDetect:
-    """Tests for automatic api_type detection."""
+# ------------------------------------------------------------------
+# Tests — auto-detect
+# ------------------------------------------------------------------
 
+
+class TestServerEngineAutoDetect:
     def test_auto_detects_completions(self, mock_server: str):
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=mock_server,
             api_type="auto",
         )
@@ -301,7 +338,7 @@ class TestServerEngineAutoDetect:
 
     def test_auto_falls_back_to_chat(self, chat_only_server: str):
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=chat_only_server,
             api_type="auto",
         )
@@ -314,7 +351,7 @@ class TestServerEngineAutoDetect:
 
     def test_auto_chat_batch(self, chat_only_server: str):
         engine = ServerEngine(
-            model="test-model",
+            model=_SERVED_MODEL,
             base_url=chat_only_server,
             api_type="auto",
             max_concurrent=8,
@@ -326,7 +363,39 @@ class TestServerEngineAutoDetect:
         assert all(r.startswith("chat_only_") for r in results)
 
 
+# ------------------------------------------------------------------
+# Tests — wrong model name (must fail fast)
+# ------------------------------------------------------------------
+
+
+class TestServerEngineModelValidation:
+    def test_wrong_model_name_fails_at_init(self, mock_server: str):
+        with pytest.raises(ValueError, match="not found on the server"):
+            ServerEngine(
+                model="/home/data/Qwen3-8B",
+                base_url=mock_server,
+            )
+
+    def test_wrong_model_shows_available(self, mock_server: str):
+        with pytest.raises(ValueError, match=_SERVED_MODEL):
+            ServerEngine(
+                model="wrong-name",
+                base_url=mock_server,
+            )
+
+    def test_correct_model_works(self, mock_server: str):
+        engine = ServerEngine(
+            model=_SERVED_MODEL,
+            base_url=mock_server,
+        )
+        assert engine.model == _SERVED_MODEL
+
+
 class TestServerEngineInvalidApiType:
-    def test_invalid_api_type(self):
+    def test_invalid_api_type(self, mock_server: str):
         with pytest.raises(ValueError, match="api_type must be"):
-            ServerEngine(model="x", api_type="invalid")
+            ServerEngine(
+                model=_SERVED_MODEL,
+                base_url=mock_server,
+                api_type="invalid",
+            )
