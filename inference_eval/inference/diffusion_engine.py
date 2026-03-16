@@ -207,7 +207,7 @@ class DiffusionEngine(InferenceEngine):
             steps_per_block=self._steps,
             temperature=temperature,
         )
-        output = self._sampler.sample(input_ids=input_ids, sampler_config=cfg)
+        output = self._sampler.sample(input_ids, cfg)
         if hasattr(output, "sequences"):
             out_ids = output.sequences[0]
         elif self._torch.is_tensor(output):
