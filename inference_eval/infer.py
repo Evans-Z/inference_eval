@@ -24,6 +24,7 @@ ENGINE_REGISTRY: dict[str, str] = {
     "sglang": "inference_eval.inference.sglang_engine.SGLangEngine",
     "openai": "inference_eval.inference.openai_engine.OpenAIEngine",
     "server": "inference_eval.inference.server_engine.ServerEngine",
+    "diffusion": "inference_eval.inference.diffusion_engine.DiffusionEngine",
 }
 
 

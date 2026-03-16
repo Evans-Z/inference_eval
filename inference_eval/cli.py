@@ -127,7 +127,7 @@ def extract(
     "--engine",
     "-e",
     required=True,
-    help="Inference engine: vllm, sglang, openai, server",
+    help="Engine: vllm, sglang, openai, server, diffusion",
 )
 @click.option("--model", "-m", required=True, help="Model name or path")
 @click.option(
@@ -209,6 +209,11 @@ def infer(
       inference-eval infer -r ./requests -o ./results \\
           -e server -m Qwen3-8B \\
           --base-url http://localhost:8068/v1 --api-type chat
+    \b
+      # Diffusion LM (LLaDA2)
+      inference-eval infer -r ./requests -o ./results \\
+          -e diffusion -m /path/to/LLaDA2.0-mini \\
+          --engine-args '{"gen_length":512,"steps":32,"block_length":32}'
     """
     _setup_logging(verbosity)
     from inference_eval.infer import run_inference
