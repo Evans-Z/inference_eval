@@ -1,21 +1,21 @@
 """Diffusion language model engine (LLaDA2, Dream, etc.).
 
-Supports both ``generate_until`` (text generation) and ``loglikelihood``
-(scoring) tasks.  Uses the `dllm <https://github.com/ZHZisZZ/dllm>`_
-framework when available for optimised sampling, with a pure-transformers
-fallback.
+Supports both ``generate_until`` and ``loglikelihood`` tasks.
+Uses `dllm <https://github.com/ZHZisZZ/dllm>`_ when available.
 
 **Speed levers** (combine for maximum throughput):
 
-- ``gpu_batch_size=4``  — process 4 prompts per GPU call (default 1)
+- ``gpu_batch_size=4``  — batch 4 prompts per GPU forward pass
 - ``devices="cuda:0,cuda:1,cuda:2,cuda:3"`` — multi-GPU parallelism
 
-Example: 4 GPUs × batch 4 = 16 prompts in flight simultaneously.
+The batched generation **reimplements** LLaDA2's block-diffusion
+loop with full batch support.  ``model.forward()`` (the heavy part)
+runs on the whole batch; per-sample confidence selection is a cheap
+Python loop.
 
 Prompts from lm-eval-harness are raw text.  By default this engine
 wraps each prompt in a chat template (``apply_chat_template=True``).
-**Do NOT combine this with ``inference-eval extract --apply-chat-template``**
-or the prompt will be double-wrapped.
+**Do NOT combine with ``inference-eval extract --apply-chat-template``**.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 
 def _truncate_at_stop(text: str, stop_sequences: list[str]) -> str:
-    """Truncate *text* at the first occurrence of any stop sequence."""
     earliest = len(text)
     for s in stop_sequences:
         idx = text.find(s)
@@ -42,8 +41,6 @@ def _truncate_at_stop(text: str, stop_sequences: list[str]) -> str:
 
 @dataclass
 class _Worker:
-    """One model instance on one GPU."""
-
     model: Any
     tokenizer: Any
     sampler: Any
@@ -57,21 +54,18 @@ class DiffusionEngine(InferenceEngine):
     Args:
         model: HuggingFace model name or local path.
         device: Single device (``"auto"``, ``"cuda:0"``).
-            Ignored if ``devices`` is set.
-        devices: Comma-separated devices for multi-GPU parallelism
-            (``"cuda:0,cuda:1,cuda:2,cuda:3"``).
-        gpu_batch_size: Number of prompts to process per GPU call.
-            Higher values increase GPU utilization.  Set to the largest
-            value that fits in GPU memory (try 2, 4, 8).
-        dtype: Torch dtype (``"bfloat16"``, ``"float16"``, ``"float32"``).
-        gen_length: Default number of new tokens to generate.
-        block_length: Block length for diffusion sampling.
-        steps: Number of demasking steps per block.
-        temperature: Sampling temperature (0 = greedy).
-        apply_chat_template: Wrap each prompt as a chat user message.
-        eos_early_stop: Stop generation early on EOS.
+        devices: Comma-separated devices for multi-GPU.
+        gpu_batch_size: Prompts per GPU forward pass (try 2, 4, 8).
+        dtype: ``"bfloat16"``, ``"float16"``, ``"float32"``.
+        gen_length: New tokens to generate.
+        block_length: Block size for diffusion sampling.
+        steps: Demasking steps per block.
+        temperature: 0 = greedy.
+        apply_chat_template: Wrap prompt as chat user message.
+        eos_early_stop: Stop early on EOS.
         mc_num: Monte-Carlo samples for ``get_log_likelihood``.
-        use_dllm: Try to use the ``dllm`` framework for generation.
+        threshold: Confidence threshold for token acceptance.
+        use_dllm: Use dllm sampler for single-prompt fallback.
     """
 
     def __init__(
@@ -88,6 +82,7 @@ class DiffusionEngine(InferenceEngine):
         apply_chat_template: bool = True,
         eos_early_stop: bool = True,
         mc_num: int = 32,
+        threshold: float = 0.95,
         use_dllm: bool = True,
         **extra_kwargs: Any,
     ) -> None:
@@ -99,18 +94,16 @@ class DiffusionEngine(InferenceEngine):
                 "torch and transformers are required for DiffusionEngine."
             ) from e
 
+        self._torch = torch
+        self._AutoModelForCausalLM = AutoModelForCausalLM
+        self._AutoTokenizer = AutoTokenizer
+        self._model_path = model
         dtype_map = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
             "float32": torch.float32,
         }
-        torch_dtype = dtype_map.get(dtype, torch.bfloat16)
-        self._torch = torch
-        self._AutoModelForCausalLM = AutoModelForCausalLM
-        self._AutoTokenizer = AutoTokenizer
-
-        self._model_path = model
-        self._torch_dtype = torch_dtype
+        self._torch_dtype = dtype_map.get(dtype, torch.bfloat16)
         self._gpu_batch_size = gpu_batch_size
         self._gen_length = gen_length
         self._block_length = block_length
@@ -119,34 +112,27 @@ class DiffusionEngine(InferenceEngine):
         self._apply_chat_template = apply_chat_template
         self._eos_early_stop = eos_early_stop
         self._mc_num = mc_num
+        self._threshold = threshold
         self._use_dllm = use_dllm
 
         device_list = [d.strip() for d in devices.split(",")] if devices else [device]
-
-        self._batch_supported: bool | None = None if gpu_batch_size > 1 else False
-
-        self._workers: list[_Worker] = []
-        for dev in device_list:
-            self._workers.append(self._create_worker(dev))
-
+        self._workers: list[_Worker] = [self._create_worker(d) for d in device_list]
         logger.info(
-            "DiffusionEngine ready: %d GPU(s) %s, gpu_batch_size=%d, "
-            "dllm=%s, gen_length=%d, steps=%d, block_length=%d",
+            "DiffusionEngine: %d GPU(s) %s, batch=%d, steps=%d, block=%d, gen=%d",
             len(self._workers),
             [w.device for w in self._workers],
             gpu_batch_size,
-            self._workers[0].sampler is not None,
-            gen_length,
             steps,
             block_length,
+            gen_length,
         )
 
     def _create_worker(self, device: str) -> _Worker:
         logger.info("Loading model on %s: %s", device, self._model_path)
-        tokenizer = self._AutoTokenizer.from_pretrained(
+        tok = self._AutoTokenizer.from_pretrained(
             self._model_path, trust_remote_code=True
         )
-        model = (
+        mdl = (
             self._AutoModelForCausalLM.from_pretrained(
                 self._model_path,
                 trust_remote_code=True,
@@ -155,44 +141,33 @@ class DiffusionEngine(InferenceEngine):
             .to(self._torch_dtype)
             .eval()
         )
-        sampler = None
-        sampler_config_cls = None
+        sampler = sampler_cfg = None
         if self._use_dllm:
             try:
                 import dllm
 
-                sampler = dllm.pipelines.llada2.LLaDA2Sampler(
-                    model=model, tokenizer=tokenizer
-                )
-                sampler_config_cls = dllm.pipelines.llada2.LLaDA2SamplerConfig
+                sampler = dllm.pipelines.llada2.LLaDA2Sampler(model=mdl, tokenizer=tok)
+                sampler_cfg = dllm.pipelines.llada2.LLaDA2SamplerConfig
             except Exception:
                 pass
-        return _Worker(
-            model=model,
-            tokenizer=tokenizer,
-            sampler=sampler,
-            sampler_config_cls=sampler_config_cls,
-            device=device,
-        )
+        return _Worker(mdl, tok, sampler, sampler_cfg, device)
 
     # ------------------------------------------------------------------
-    # tokenisation helpers
+    # tokenisation
     # ------------------------------------------------------------------
 
-    def _tokenize_prompt(self, worker: _Worker, prompt: str) -> Any:
+    def _tokenize(self, w: _Worker, prompt: str) -> Any:
         if self._apply_chat_template:
-            ids = worker.tokenizer.apply_chat_template(
+            return w.tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
                 tokenize=True,
                 return_tensors="pt",
-            )
-        else:
-            ids = worker.tokenizer(prompt, return_tensors="pt").input_ids
-        return ids.to(worker.model.device)
+            ).to(w.model.device)
+        return w.tokenizer(prompt, return_tensors="pt").input_ids.to(w.model.device)
 
     # ------------------------------------------------------------------
-    # generate
+    # generate (dispatch)
     # ------------------------------------------------------------------
 
     def generate(
@@ -202,211 +177,216 @@ class DiffusionEngine(InferenceEngine):
     ) -> list[str]:
         if not prompts:
             return []
+        nw = len(self._workers)
+        if nw == 1:
+            return self._gen_worker(self._workers[0], prompts, gen_kwargs)
 
-        n_workers = len(self._workers)
-        if n_workers == 1:
-            return self._generate_on_worker(self._workers[0], prompts, gen_kwargs)
-
-        # Multi-GPU: distribute prompts round-robin across workers
-        buckets: list[list[tuple[int, str, dict]]] = [[] for _ in range(n_workers)]
-        for i, (p, kw) in enumerate(zip(prompts, gen_kwargs)):
-            buckets[i % n_workers].append((i, p, kw))
-
+        buckets: list[list[tuple[int, str, dict]]] = [[] for _ in range(nw)]
+        for i, (p, k) in enumerate(zip(prompts, gen_kwargs)):
+            buckets[i % nw].append((i, p, k))
         results: list[str | None] = [None] * len(prompts)
 
-        def _run_bucket(worker_idx: int) -> list[tuple[int, str]]:
-            worker = self._workers[worker_idx]
-            bucket = buckets[worker_idx]
-            idxs = [t[0] for t in bucket]
-            ps = [t[1] for t in bucket]
-            kws = [t[2] for t in bucket]
-            texts = self._generate_on_worker(worker, ps, kws)
-            return list(zip(idxs, texts))
+        def _run(wi: int) -> list[tuple[int, str]]:
+            b = buckets[wi]
+            ts = self._gen_worker(
+                self._workers[wi], [x[1] for x in b], [x[2] for x in b]
+            )
+            return [(x[0], t) for x, t in zip(b, ts)]
 
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futs = {
-                pool.submit(_run_bucket, wi): wi
-                for wi in range(n_workers)
-                if buckets[wi]
-            }
-            for fut in as_completed(futs):
-                for idx, text in fut.result():
-                    results[idx] = text
+        with ThreadPoolExecutor(max_workers=nw) as pool:
+            for fut in as_completed(
+                pool.submit(_run, i) for i in range(nw) if buckets[i]
+            ):
+                for idx, txt in fut.result():
+                    results[idx] = txt
+        return [r or "" for r in results]
 
-        return [r if r is not None else "" for r in results]
-
-    def _generate_on_worker(
-        self,
-        worker: _Worker,
-        prompts: list[str],
-        gen_kwargs: list[dict[str, Any]],
-    ) -> list[str]:
-        """Process prompts on a single worker in mini-batches."""
+    def _gen_worker(self, w: _Worker, prompts: list, kws: list) -> list:
         bs = self._gpu_batch_size
-        use_batch = bs > 1 and self._batch_supported is not False
-        results: list[str] = []
+        out: list[str] = []
         for i in range(0, len(prompts), bs):
-            batch_p = prompts[i : i + bs]
-            batch_kw = gen_kwargs[i : i + bs]
-            if use_batch and len(batch_p) > 1:
-                results.extend(self._generate_batch(worker, batch_p, batch_kw))
+            bp = prompts[i : i + bs]
+            bk = kws[i : i + bs]
+            if len(bp) > 1 and bs > 1:
+                out.extend(self._gen_batch(w, bp, bk))
             else:
-                for p, kw in zip(batch_p, batch_kw):
-                    results.append(self._generate_single(worker, p, kw))
-        return results
+                for p, k in zip(bp, bk):
+                    out.append(self._gen_single(w, p, k))
+        return out
 
-    def _generate_batch(
+    # ------------------------------------------------------------------
+    # single-prompt generation (uses dllm or model.generate)
+    # ------------------------------------------------------------------
+
+    def _gen_single(self, w: _Worker, prompt: str, kw: dict) -> str:
+        ids = self._tokenize(w, prompt)
+        ilen = ids.shape[1]
+        gl = kw.get("max_gen_toks", kw.get("max_tokens", self._gen_length))
+        t = kw.get("temperature", self._temperature)
+
+        if w.sampler is not None:
+            cfg = w.sampler_config_cls(
+                max_new_tokens=gl,
+                block_size=self._block_length,
+                steps_per_block=self._steps,
+                temperature=t,
+            )
+            o = w.sampler.sample(ids, cfg)
+            if hasattr(o, "sequences"):
+                o = o.sequences
+            out = o[0] if self._torch.is_tensor(o) else o
+            text = w.tokenizer.decode(out[ilen:], skip_special_tokens=True)
+        else:
+            with self._torch.no_grad():
+                o = w.model.generate(
+                    inputs=ids,
+                    gen_length=gl,
+                    block_length=self._block_length,
+                    steps=self._steps,
+                    temperature=t,
+                    eos_early_stop=self._eos_early_stop,
+                )
+            text = w.tokenizer.decode(o[0][ilen:], skip_special_tokens=True)
+
+        stop = kw.get("until", kw.get("stop", []))
+        if isinstance(stop, str):
+            stop = [stop]
+        return _truncate_at_stop(text, stop) if stop else text
+
+    # ------------------------------------------------------------------
+    # batched generation — reimplements LLaDA2's block-diffusion loop
+    # ------------------------------------------------------------------
+
+    def _gen_batch(
         self,
-        worker: _Worker,
+        w: _Worker,
         prompts: list[str],
         gen_kwargs: list[dict[str, Any]],
     ) -> list[str]:
-        """Batch-generate: pad multiple prompts and call model once."""
-        all_ids = [self._tokenize_prompt(worker, p) for p in prompts]
-        input_lens = [ids.shape[1] for ids in all_ids]
-        max_len = max(input_lens)
+        """Batched block-diffusion generation.
 
-        pad_id = worker.tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = worker.tokenizer.eos_token_id or 0
+        ``model.forward()`` runs on the full batch (the expensive GPU
+        part).  Per-sample confidence selection is a cheap Python loop
+        on tensors of length ``block_length`` (typically 32).
+        """
+        torch = self._torch
+        model = w.model
+        device = model.device
 
-        # Left-pad so generation starts at the same position
-        padded = self._torch.full(
-            (len(all_ids), max_len),
-            pad_id,
-            dtype=all_ids[0].dtype,
-            device=worker.model.device,
-        )
-        attention_mask = self._torch.zeros(
-            (len(all_ids), max_len),
-            dtype=self._torch.long,
-            device=worker.model.device,
-        )
+        all_ids = [self._tokenize(w, p) for p in prompts]
+        max_plen = max(ids.shape[1] for ids in all_ids)
+
+        mask_id = getattr(model.config, "mask_token_id", 156895)
+        eos_id = getattr(model.config, "eos_token_id", 156892)
+        pad_id = w.tokenizer.pad_token_id or eos_id or 0
+
+        # Left-pad prompts to the same length
+        batch = len(all_ids)
+        padded = torch.full((batch, max_plen), pad_id, dtype=torch.long, device=device)
         for i, ids in enumerate(all_ids):
-            seq_len = ids.shape[1]
-            padded[i, max_len - seq_len :] = ids[0]
-            attention_mask[i, max_len - seq_len :] = 1
+            padded[i, max_plen - ids.shape[1] :] = ids[0]
 
         kw0 = gen_kwargs[0]
-        gen_len = kw0.get("max_gen_toks", kw0.get("max_tokens", self._gen_length))
-        temp = kw0.get("temperature", self._temperature)
+        gen_length = kw0.get("max_gen_toks", kw0.get("max_tokens", self._gen_length))
+        temperature = kw0.get("temperature", self._temperature)
+        block_length = self._block_length
+        steps = min(self._steps, gen_length)
+        threshold = self._threshold
 
-        try:
-            if worker.sampler is not None:
-                cfg = worker.sampler_config_cls(
-                    max_new_tokens=gen_len,
-                    block_size=self._block_length,
-                    steps_per_block=self._steps,
-                    temperature=temp,
+        prompt_length = max_plen
+        num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
+        total_length = num_blocks * block_length
+        prefill_blocks = prompt_length // block_length
+
+        # Block-diagonal causal mask — shared across batch (broadcasts)
+        bm = torch.tril(torch.ones(num_blocks, num_blocks, device=device))
+        attn = (
+            bm.repeat_interleave(block_length, dim=0)
+            .repeat_interleave(block_length, dim=1)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .log()
+            .to(torch.bfloat16)
+        )
+
+        pos = torch.arange(total_length, device=device).unsqueeze(0)
+
+        x = torch.full((batch, total_length), mask_id, dtype=torch.long, device=device)
+        x[:, :prompt_length] = padded
+
+        schedule = model._get_num_transfer_tokens(block_length, steps)
+        done = torch.zeros(batch, dtype=torch.bool, device=device)
+
+        for nb in range(prefill_blocks, num_blocks):
+            if done.all():
+                break
+            we = (nb + 1) * block_length
+            cx = x[:, :we]
+            ca = attn[:, :, :we, :we]
+            cp = pos[:, :we]
+
+            for step in range(steps):
+                amask = cx[:, -block_length:] == mask_id
+                if amask.sum() == 0:
+                    break
+
+                with torch.no_grad():
+                    logits = model.forward(
+                        cx, attention_mask=ca, position_ids=cp
+                    ).logits
+
+                alog = logits[:, -block_length:, :]
+                x0, x0_p = model._sample_with_temperature_topk_topp(
+                    alog, temperature=temperature
                 )
-                output_ids = worker.sampler.sample(padded, cfg)
-            else:
-                with self._torch.no_grad():
-                    output_ids = worker.model.generate(
-                        inputs=padded,
-                        attention_mask=attention_mask,
-                        gen_length=gen_len,
-                        block_length=self._block_length,
-                        steps=self._steps,
-                        temperature=temp,
-                        eos_early_stop=self._eos_early_stop,
+
+                ntrans = schedule[step].item()
+
+                for b in range(batch):
+                    if done[b]:
+                        continue
+                    conf = torch.where(
+                        amask[b], x0_p[b], torch.tensor(-float("inf"), device=device)
                     )
-        except Exception as exc:
-            self._batch_supported = False
-            logger.warning(
-                "Batch generation not supported by this model (%s). "
-                "Falling back to single-prompt mode for all "
-                "remaining requests.",
-                exc,
-            )
-            return [
-                self._generate_single(worker, p, kw)
-                for p, kw in zip(prompts, gen_kwargs)
-            ]
+                    high = conf > threshold
+                    nh = high.sum().item()
+                    na = amask[b].sum().item()
+                    k = min(ntrans, na)
 
-        self._batch_supported = True
+                    if k == 0:
+                        continue
 
-        # Extract generated text per prompt
+                    if nh >= ntrans:
+                        idx = high.nonzero(as_tuple=True)[0][:k]
+                    else:
+                        _, idx = torch.topk(conf, k=k)
+
+                    cx[b, -block_length + idx] = x0[b, idx]
+
+                    if self._eos_early_stop and (x0[b, idx] == eos_id).any():
+                        gr = cx[b, prompt_length:]
+                        eh = (gr == eos_id).nonzero(as_tuple=True)[0]
+                        if len(eh) > 0:
+                            before = gr[: eh[0].item()]
+                            if (before != mask_id).all():
+                                done[b] = True
+
+            x[:, :we] = cx
+
+        # Extract generated text per sample
         results: list[str] = []
-        if hasattr(output_ids, "sequences"):
-            output_ids = output_ids.sequences
-        for i in range(len(prompts)):
-            new_ids = output_ids[i][max_len:]
-            text = worker.tokenizer.decode(new_ids, skip_special_tokens=True)
-            stop = gen_kwargs[i].get("until", gen_kwargs[i].get("stop", []))
+        for b in range(batch):
+            gen = x[b, prompt_length : prompt_length + gen_length]
+            eh = (gen == eos_id).nonzero(as_tuple=True)[0]
+            end = eh[0].item() + 1 if len(eh) > 0 else gen_length
+            text = w.tokenizer.decode(gen[:end], skip_special_tokens=True)
+            stop = gen_kwargs[b].get("until", gen_kwargs[b].get("stop", []))
             if isinstance(stop, str):
                 stop = [stop]
             if stop:
                 text = _truncate_at_stop(text, stop)
             results.append(text)
         return results
-
-    def _generate_single(
-        self,
-        worker: _Worker,
-        prompt: str,
-        kw: dict[str, Any],
-    ) -> str:
-        input_ids = self._tokenize_prompt(worker, prompt)
-        input_len = input_ids.shape[1]
-        gen_len = kw.get("max_gen_toks", kw.get("max_tokens", self._gen_length))
-        temp = kw.get("temperature", self._temperature)
-
-        if worker.sampler is not None:
-            text = self._gen_dllm(worker, input_ids, input_len, gen_len, temp)
-        else:
-            text = self._gen_transformers(worker, input_ids, input_len, gen_len, temp)
-
-        stop = kw.get("until", kw.get("stop", []))
-        if isinstance(stop, str):
-            stop = [stop]
-        if stop:
-            text = _truncate_at_stop(text, stop)
-        return text
-
-    def _gen_dllm(
-        self,
-        worker: _Worker,
-        input_ids: Any,
-        input_len: int,
-        gen_length: int,
-        temperature: float,
-    ) -> str:
-        cfg = worker.sampler_config_cls(
-            max_new_tokens=gen_length,
-            block_size=self._block_length,
-            steps_per_block=self._steps,
-            temperature=temperature,
-        )
-        output = worker.sampler.sample(input_ids, cfg)
-        if hasattr(output, "sequences"):
-            out_ids = output.sequences[0]
-        elif self._torch.is_tensor(output):
-            out_ids = output[0]
-        else:
-            out_ids = output
-        new_ids = out_ids[input_len:]
-        return worker.tokenizer.decode(new_ids, skip_special_tokens=True)
-
-    def _gen_transformers(
-        self,
-        worker: _Worker,
-        input_ids: Any,
-        input_len: int,
-        gen_length: int,
-        temperature: float,
-    ) -> str:
-        with self._torch.no_grad():
-            output_ids = worker.model.generate(
-                inputs=input_ids,
-                gen_length=gen_length,
-                block_length=self._block_length,
-                steps=self._steps,
-                temperature=temperature,
-                eos_early_stop=self._eos_early_stop,
-            )
-        new_ids = output_ids[0][input_len:]
-        return worker.tokenizer.decode(new_ids, skip_special_tokens=True)
 
     # ------------------------------------------------------------------
     # loglikelihood
@@ -417,56 +397,40 @@ class DiffusionEngine(InferenceEngine):
         contexts: list[str],
         continuations: list[str],
     ) -> list[tuple[float, bool]]:
-        """Compute log-likelihoods using the model's diffusion scorer."""
         if not contexts:
             return []
-
         if not hasattr(self._workers[0].model, "get_log_likelihood"):
             raise NotImplementedError(
-                "This model does not expose get_log_likelihood(). "
-                "Make sure you are using a LLaDA / LLaDA2 model "
-                "loaded with trust_remote_code=True, or install dllm."
+                "Model does not expose get_log_likelihood(). "
+                "Use a LLaDA/LLaDA2 model with trust_remote_code=True."
             )
-
-        n_workers = len(self._workers)
-        if n_workers == 1:
+        nw = len(self._workers)
+        if nw == 1:
             return [
-                self._ll_single(self._workers[0], ctx, cont)
-                for ctx, cont in zip(contexts, continuations)
+                self._ll_one(self._workers[0], c, t)
+                for c, t in zip(contexts, continuations)
             ]
-
         results: list[tuple[float, bool] | None] = [None] * len(contexts)
 
-        def _work(idx: int) -> tuple[int, tuple[float, bool]]:
-            worker = self._workers[idx % n_workers]
-            return idx, self._ll_single(worker, contexts[idx], continuations[idx])
+        def _w(i: int) -> tuple[int, tuple[float, bool]]:
+            return i, self._ll_one(self._workers[i % nw], contexts[i], continuations[i])
 
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futs = {pool.submit(_work, i): i for i in range(len(contexts))}
-            for fut in as_completed(futs):
-                idx, result = fut.result()
-                results[idx] = result
-
+        with ThreadPoolExecutor(max_workers=nw) as pool:
+            for f in as_completed(pool.submit(_w, i) for i in range(len(contexts))):
+                i, r = f.result()
+                results[i] = r
         return [r if r is not None else (0.0, True) for r in results]
 
-    def _ll_single(
-        self, worker: _Worker, context: str, continuation: str
+    def _ll_one(
+        self, w: _Worker, context: str, continuation: str
     ) -> tuple[float, bool]:
-        ctx_ids = worker.tokenizer(context, return_tensors="pt").input_ids
-        full_ids = worker.tokenizer(
-            context + continuation, return_tensors="pt"
-        ).input_ids
-        ctx_ids = ctx_ids.to(worker.model.device)
-        full_ids = full_ids.to(worker.model.device)
-
-        ctx_len = ctx_ids.shape[1]
-        target_ids = full_ids.clone()
-        target_ids[:, :ctx_len] = -100
-
+        ci = w.tokenizer(context, return_tensors="pt").input_ids.to(w.model.device)
+        fi = w.tokenizer(context + continuation, return_tensors="pt").input_ids.to(
+            w.model.device
+        )
+        ti = fi.clone()
+        ti[:, : ci.shape[1]] = -100
         with self._torch.no_grad():
-            ll = worker.model.get_log_likelihood(
-                full_ids, target_ids, mc_num=self._mc_num
-            )
-
-        val = ll.item() if self._torch.is_tensor(ll) else float(ll)
-        return (val, True)
+            ll = w.model.get_log_likelihood(fi, ti, mc_num=self._mc_num)
+        v = ll.item() if self._torch.is_tensor(ll) else float(ll)
+        return (v, True)
