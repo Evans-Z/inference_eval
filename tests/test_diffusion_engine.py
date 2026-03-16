@@ -40,11 +40,20 @@ class TestDiffusionEngineNoModel:
     """Tests that work without a real model (mock-based)."""
 
     def test_loglikelihood_raises_without_method(self):
-        from inference_eval.inference.diffusion_engine import DiffusionEngine
+        from inference_eval.inference.diffusion_engine import DiffusionEngine, _Worker
 
         with patch.object(DiffusionEngine, "__init__", lambda self, **kw: None):
             engine = DiffusionEngine.__new__(DiffusionEngine)
-            engine._model = MagicMock(spec=[])
+            mock_model = MagicMock(spec=[])
+            engine._workers = [
+                _Worker(
+                    model=mock_model,
+                    tokenizer=MagicMock(),
+                    sampler=None,
+                    sampler_config_cls=None,
+                    device="cpu",
+                )
+            ]
             with pytest.raises(NotImplementedError, match="get_log_likelihood"):
                 engine.compute_loglikelihood(["ctx"], ["cont"])
 
