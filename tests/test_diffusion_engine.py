@@ -36,34 +36,38 @@ class TestTruncateAtStop:
         assert _truncate_at_stop(text, ["\n\n", "Question:"]) == "A "
 
 
-class TestDiffusionEngineLoglikelihood:
-    def test_loglikelihood_raises(self):
+class TestDiffusionEngineNoModel:
+    """Tests that work without a real model (mock-based)."""
+
+    def test_loglikelihood_raises_without_method(self):
         from inference_eval.inference.diffusion_engine import DiffusionEngine
 
         with patch.object(DiffusionEngine, "__init__", lambda self, **kw: None):
             engine = DiffusionEngine.__new__(DiffusionEngine)
-            with pytest.raises(NotImplementedError, match="[Dd]iffusion"):
+            engine._model = MagicMock(spec=[])
+            with pytest.raises(NotImplementedError, match="get_log_likelihood"):
                 engine.compute_loglikelihood(["ctx"], ["cont"])
 
-
-class TestDiffusionEngineProcessRequests:
-    def test_loglikelihood_requests_raise(self):
+    def test_process_requests_generate(self):
         from inference_eval.inference.diffusion_engine import DiffusionEngine
         from inference_eval.schema import InferenceRequest
 
         with patch.object(DiffusionEngine, "__init__", lambda self, **kw: None):
             engine = DiffusionEngine.__new__(DiffusionEngine)
-            engine.generate = MagicMock(return_value=[])
+            engine.generate = MagicMock(return_value=["answer"])
+            engine.compute_loglikelihood = MagicMock()
 
-            requests = [
+            reqs = [
                 InferenceRequest(
-                    task_name="hellaswag",
-                    request_type="loglikelihood",
+                    task_name="gsm8k",
+                    request_type="generate_until",
                     doc_id=0,
                     index=0,
-                    context="ctx",
-                    continuation=" cont",
+                    context="Q: 2+2?",
+                    generation_kwargs={"until": ["\n"]},
                 ),
             ]
-            with pytest.raises(NotImplementedError):
-                engine.process_requests(requests)
+            results = engine.process_requests(reqs)
+            assert len(results) == 1
+            assert results[0].generated_text == "answer"
+            engine.generate.assert_called_once()
