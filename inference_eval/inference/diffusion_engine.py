@@ -274,8 +274,15 @@ class DiffusionEngine(InferenceEngine):
             dtype=all_ids[0].dtype,
             device=worker.model.device,
         )
+        attention_mask = self._torch.zeros(
+            (len(all_ids), max_len),
+            dtype=self._torch.long,
+            device=worker.model.device,
+        )
         for i, ids in enumerate(all_ids):
-            padded[i, max_len - ids.shape[1] :] = ids[0]
+            seq_len = ids.shape[1]
+            padded[i, max_len - seq_len :] = ids[0]
+            attention_mask[i, max_len - seq_len :] = 1
 
         kw0 = gen_kwargs[0]
         gen_len = kw0.get("max_gen_toks", kw0.get("max_tokens", self._gen_length))
@@ -294,6 +301,7 @@ class DiffusionEngine(InferenceEngine):
                 with self._torch.no_grad():
                     output_ids = worker.model.generate(
                         inputs=padded,
+                        attention_mask=attention_mask,
                         gen_length=gen_len,
                         block_length=self._block_length,
                         steps=self._steps,
