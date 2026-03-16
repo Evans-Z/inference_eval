@@ -123,6 +123,8 @@ class DiffusionEngine(InferenceEngine):
 
         device_list = [d.strip() for d in devices.split(",")] if devices else [device]
 
+        self._batch_supported: bool | None = None if gpu_batch_size > 1 else False
+
         self._workers: list[_Worker] = []
         for dev in device_list:
             self._workers.append(self._create_worker(dev))
@@ -241,15 +243,16 @@ class DiffusionEngine(InferenceEngine):
     ) -> list[str]:
         """Process prompts on a single worker in mini-batches."""
         bs = self._gpu_batch_size
+        use_batch = bs > 1 and self._batch_supported is not False
         results: list[str] = []
         for i in range(0, len(prompts), bs):
             batch_p = prompts[i : i + bs]
             batch_kw = gen_kwargs[i : i + bs]
-            if len(batch_p) == 1 or bs == 1:
+            if use_batch and len(batch_p) > 1:
+                results.extend(self._generate_batch(worker, batch_p, batch_kw))
+            else:
                 for p, kw in zip(batch_p, batch_kw):
                     results.append(self._generate_single(worker, p, kw))
-            else:
-                results.extend(self._generate_batch(worker, batch_p, batch_kw))
         return results
 
     def _generate_batch(
@@ -309,16 +312,19 @@ class DiffusionEngine(InferenceEngine):
                         eos_early_stop=self._eos_early_stop,
                     )
         except Exception as exc:
+            self._batch_supported = False
             logger.warning(
-                "Batch generation failed (%s), falling back to "
-                "single-prompt mode. Set gpu_batch_size=1 to "
-                "silence this warning.",
+                "Batch generation not supported by this model (%s). "
+                "Falling back to single-prompt mode for all "
+                "remaining requests.",
                 exc,
             )
             return [
                 self._generate_single(worker, p, kw)
                 for p, kw in zip(prompts, gen_kwargs)
             ]
+
+        self._batch_supported = True
 
         # Extract generated text per prompt
         results: list[str] = []
