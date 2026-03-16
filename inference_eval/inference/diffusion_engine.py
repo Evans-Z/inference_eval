@@ -298,13 +298,15 @@ class DiffusionEngine(InferenceEngine):
         total_length = num_blocks * block_length
         prefill_blocks = prompt_length // block_length
 
-        # Block-diagonal causal mask — shared across batch (broadcasts)
+        # Block-diagonal causal mask — expanded to batch size
+        # (LLaDA2 forward() requires exact batch dim match, no broadcast)
         bm = torch.tril(torch.ones(num_blocks, num_blocks, device=device))
         attn = (
             bm.repeat_interleave(block_length, dim=0)
             .repeat_interleave(block_length, dim=1)
             .unsqueeze(0)
             .unsqueeze(0)
+            .expand(batch, -1, -1, -1)
             .log()
             .to(torch.bfloat16)
         )
