@@ -143,6 +143,20 @@ class DiffusionEngine(InferenceEngine):
 
     def _create_worker(self, device: str) -> _Worker:
         logger.info("Loading model on %s: %s", device, self._model_path)
+
+        # Try dllm first — uses the same optimised loading as chat.py
+        if self._use_dllm:
+            try:
+                worker = self._create_worker_dllm(device)
+                logger.info("Loaded via dllm (optimised path)")
+                return worker
+            except Exception as exc:
+                logger.info(
+                    "dllm loading failed (%s), falling back to transformers",
+                    exc,
+                )
+
+        # Fallback: raw transformers
         tokenizer = self._AutoTokenizer.from_pretrained(
             self._model_path, trust_remote_code=True
         )
@@ -155,24 +169,43 @@ class DiffusionEngine(InferenceEngine):
             .to(self._torch_dtype)
             .eval()
         )
-        sampler = None
-        sampler_config_cls = None
-        if self._use_dllm:
-            try:
-                import dllm
+        return _Worker(
+            model=model,
+            tokenizer=tokenizer,
+            sampler=None,
+            sampler_config_cls=None,
+            device=device,
+        )
 
-                sampler = dllm.pipelines.llada2.LLaDA2Sampler(
-                    model=model, tokenizer=tokenizer
-                )
-                sampler_config_cls = dllm.pipelines.llada2.LLaDA2SamplerConfig
-            except Exception:
-                pass
+    def _create_worker_dllm(self, device: str) -> _Worker:
+        """Load model + sampler via dllm (same path as chat.py)."""
+        from dataclasses import dataclass as _dc
+
+        import dllm
+
+        @_dc
+        class _Args:
+            model_name_or_path: str = self._model_path
+
+        args = _Args()
+        model = dllm.utils.get_model(model_args=args).eval()
+        tokenizer = dllm.utils.get_tokenizer(model_args=args)
+        sampler = dllm.pipelines.llada2.LLaDA2Sampler(model=model, tokenizer=tokenizer)
+        sampler_config_cls = dllm.pipelines.llada2.LLaDA2SamplerConfig
+
+        actual_device = device
+        if device != "auto":
+            model = model.to(device)
+            actual_device = device
+        else:
+            actual_device = str(next(model.parameters()).device)
+
         return _Worker(
             model=model,
             tokenizer=tokenizer,
             sampler=sampler,
             sampler_config_cls=sampler_config_cls,
-            device=device,
+            device=actual_device,
         )
 
     # ------------------------------------------------------------------
