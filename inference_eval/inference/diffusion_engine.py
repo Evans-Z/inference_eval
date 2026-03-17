@@ -336,11 +336,13 @@ class DiffusionEngine(InferenceEngine):
                     [[{"role": "user", "content": p}]],
                     add_generation_prompt=True,
                 )
+                if not torch.is_tensor(inp):
+                    inp = torch.tensor(inp, dtype=torch.long)
+                if inp.dim() == 1:
+                    inp = inp.unsqueeze(0)
             else:
-                inp = worker.tokenizer(p, return_tensors="pt").input_ids.to(
-                    worker.model.device
-                )
-            all_inputs.append(inp)
+                inp = worker.tokenizer(p, return_tensors="pt").input_ids
+            all_inputs.append(inp.to(worker.model.device))
 
         # Left-pad to the same length
         max_len = max(inp.shape[-1] for inp in all_inputs)
