@@ -124,6 +124,13 @@ class DiffusionEngine(InferenceEngine):
         device_list = [d.strip() for d in devices.split(",")] if devices else [device]
 
         self._batch_supported: bool | None = None if gpu_batch_size > 1 else False
+        self._has_dllm = False
+        try:
+            import dllm  # noqa: F401
+
+            self._has_dllm = True
+        except ImportError:
+            pass
 
         self._workers: list[_Worker] = []
         for dev in device_list:
@@ -213,6 +220,18 @@ class DiffusionEngine(InferenceEngine):
     # ------------------------------------------------------------------
 
     def _tokenize_prompt(self, worker: _Worker, prompt: str) -> Any:
+        """Tokenize a prompt.  Uses dllm.utils.build_chat_inputs when
+        available (matches chat.py exactly), otherwise falls back to
+        the tokenizer's apply_chat_template / raw encode.
+        """
+        if self._apply_chat_template and self._has_dllm:
+            import dllm
+
+            messages = [{"role": "user", "content": prompt}]
+            return dllm.utils.build_chat_inputs(
+                worker.tokenizer, [messages], add_generation_prompt=True
+            )
+
         if self._apply_chat_template:
             ids = worker.tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
@@ -405,21 +424,21 @@ class DiffusionEngine(InferenceEngine):
         gen_length: int,
         temperature: float,
     ) -> str:
+        import dllm
+
         cfg = worker.sampler_config_cls(
             max_new_tokens=gen_length,
             block_size=self._block_length,
             steps_per_block=self._steps,
             temperature=temperature,
         )
-        output = worker.sampler.sample(input_ids, cfg)
-        if hasattr(output, "sequences"):
-            out_ids = output.sequences[0]
-        elif self._torch.is_tensor(output):
-            out_ids = output[0]
-        else:
-            out_ids = output
-        new_ids = out_ids[input_len:]
-        return worker.tokenizer.decode(new_ids, skip_special_tokens=True)
+        outputs = worker.sampler.sample(input_ids, cfg, return_dict=True)
+        reply = dllm.utils.sample_trim(
+            worker.tokenizer,
+            outputs.sequences.tolist(),
+            input_ids,
+        )[0]
+        return reply
 
     def _gen_transformers(
         self,
