@@ -126,7 +126,7 @@ class DiffusionEngine(InferenceEngine):
         self._batch_supported: bool | None = None if gpu_batch_size > 1 else False
         self._has_dllm = False
         try:
-            import dllm  # noqa: F401
+            import dllm.dllm  # noqa: F401
 
             self._has_dllm = True
         except ImportError:
@@ -188,17 +188,17 @@ class DiffusionEngine(InferenceEngine):
         """Load model + sampler via dllm (same path as chat.py)."""
         from dataclasses import dataclass as _dc
 
-        import dllm
+        import dllm.dllm as _dllm
 
         @_dc
         class _Args:
             model_name_or_path: str = self._model_path
 
         args = _Args()
-        model = dllm.utils.get_model(model_args=args).eval()
-        tokenizer = dllm.utils.get_tokenizer(model_args=args)
-        sampler = dllm.pipelines.llada2.LLaDA2Sampler(model=model, tokenizer=tokenizer)
-        sampler_config_cls = dllm.pipelines.llada2.LLaDA2SamplerConfig
+        model = _dllm.utils.get_model(model_args=args).eval()
+        tokenizer = _dllm.utils.get_tokenizer(model_args=args)
+        sampler = _dllm.pipelines.llada2.LLaDA2Sampler(model=model, tokenizer=tokenizer)
+        sampler_config_cls = _dllm.pipelines.llada2.LLaDA2SamplerConfig
 
         actual_device = device
         if device != "auto":
@@ -225,10 +225,10 @@ class DiffusionEngine(InferenceEngine):
         the tokenizer's apply_chat_template / raw encode.
         """
         if self._apply_chat_template and self._has_dllm:
-            import dllm
+            import dllm.dllm as _dllm
 
             messages = [{"role": "user", "content": prompt}]
-            return dllm.utils.build_chat_inputs(
+            return _dllm.utils.build_chat_inputs(
                 worker.tokenizer, [messages], add_generation_prompt=True
             )
 
@@ -399,14 +399,14 @@ class DiffusionEngine(InferenceEngine):
         prompt: str,
         kw: dict[str, Any],
     ) -> str:
-        input_ids = self._tokenize_prompt(worker, prompt)
-        input_len = input_ids.shape[1]
         gen_len = kw.get("max_gen_toks", kw.get("max_tokens", self._gen_length))
         temp = kw.get("temperature", self._temperature)
 
-        if worker.sampler is not None:
-            text = self._gen_dllm(worker, input_ids, input_len, gen_len, temp)
+        if worker.sampler is not None and self._has_dllm:
+            text = self._gen_dllm(worker, prompt, gen_len, temp)
         else:
+            input_ids = self._tokenize_prompt(worker, prompt)
+            input_len = input_ids.shape[1]
             text = self._gen_transformers(worker, input_ids, input_len, gen_len, temp)
 
         stop = kw.get("until", kw.get("stop", []))
@@ -419,12 +419,24 @@ class DiffusionEngine(InferenceEngine):
     def _gen_dllm(
         self,
         worker: _Worker,
-        input_ids: Any,
-        input_len: int,
+        prompt: str,
         gen_length: int,
         temperature: float,
     ) -> str:
-        import dllm
+        """Generate using dllm — matches chat.py flow exactly."""
+        import dllm.dllm as _dllm
+
+        if self._apply_chat_template:
+            messages = [{"role": "user", "content": prompt}]
+            inputs = _dllm.utils.build_chat_inputs(
+                worker.tokenizer,
+                [messages],
+                add_generation_prompt=True,
+            )
+        else:
+            inputs = worker.tokenizer(prompt, return_tensors="pt").input_ids.to(
+                worker.model.device
+            )
 
         cfg = worker.sampler_config_cls(
             max_new_tokens=gen_length,
@@ -432,11 +444,11 @@ class DiffusionEngine(InferenceEngine):
             steps_per_block=self._steps,
             temperature=temperature,
         )
-        outputs = worker.sampler.sample(input_ids, cfg, return_dict=True)
-        reply = dllm.utils.sample_trim(
+        outputs = worker.sampler.sample(inputs, cfg, return_dict=True)
+        reply = _dllm.utils.sample_trim(
             worker.tokenizer,
             outputs.sequences.tolist(),
-            input_ids,
+            inputs,
         )[0]
         return reply
 
