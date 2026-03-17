@@ -376,14 +376,24 @@ class DiffusionEngine(InferenceEngine):
 
         self._batch_supported = True
 
-        replies = _dllm.utils.sample_trim(
-            worker.tokenizer,
-            outputs.sequences.tolist(),
-            padded,
-        )
-
+        # Extract per-prompt using ORIGINAL (unpadded) inputs
+        # so sample_trim correctly identifies the generation boundary
         results: list[str] = []
-        for i, reply in enumerate(replies):
+        for i in range(len(prompts)):
+            seq_i = outputs.sequences[i : i + 1]
+            reply = _dllm.utils.sample_trim(
+                worker.tokenizer,
+                seq_i.tolist(),
+                all_inputs[i],
+            )[0]
+            logger.debug(
+                "[batch %d/%d] prompt_len=%d generated=%d chars: %s",
+                i + 1,
+                len(prompts),
+                all_inputs[i].shape[-1],
+                len(reply),
+                repr(reply[:120]),
+            )
             stop = gen_kwargs[i].get("until", gen_kwargs[i].get("stop", []))
             if isinstance(stop, str):
                 stop = [stop]
@@ -449,6 +459,11 @@ class DiffusionEngine(InferenceEngine):
             outputs.sequences.tolist(),
             inputs,
         )[0]
+        logger.debug(
+            "[single] generated=%d chars: %s",
+            len(reply),
+            repr(reply[:120]),
+        )
         return reply
 
     def _gen_transformers(
