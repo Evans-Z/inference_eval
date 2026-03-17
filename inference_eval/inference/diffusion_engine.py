@@ -365,7 +365,13 @@ class DiffusionEngine(InferenceEngine):
 
                     cx[b, -block_length + idx] = x0[b, idx]
 
-                    if self._eos_early_stop and (x0[b, idx] == eos_id).any():
+                    eos_check = x0[b, idx] == eos_id
+                    has_eos = (
+                        eos_check.any()
+                        if hasattr(eos_check, "any")
+                        else bool(eos_check)
+                    )
+                    if self._eos_early_stop and has_eos:
                         gr = cx[b, prompt_length:]
                         eh = (gr == eos_id).nonzero(as_tuple=True)[0]
                         if len(eh) > 0:
