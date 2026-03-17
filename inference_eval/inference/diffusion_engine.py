@@ -373,10 +373,13 @@ class DiffusionEngine(InferenceEngine):
                     )
                     if self._eos_early_stop and has_eos:
                         gr = cx[b, prompt_length:]
-                        eh = (gr == eos_id).nonzero(as_tuple=True)[0]
-                        if len(eh) > 0:
-                            before = gr[: eh[0].item()]
-                            if (before != mask_id).all():
+                        if gr.dim() == 0:
+                            gr = gr.unsqueeze(0)
+                        eos_pos = (gr == eos_id).nonzero(as_tuple=False)
+                        if len(eos_pos) > 0:
+                            ep = eos_pos[0, 0].item()
+                            before = gr[:ep]
+                            if before.numel() == 0 or (before != mask_id).all():
                                 done[b] = True
 
             x[:, :we] = cx
@@ -385,8 +388,13 @@ class DiffusionEngine(InferenceEngine):
         results: list[str] = []
         for b in range(batch):
             gen = x[b, prompt_length : prompt_length + gen_length]
-            eh = (gen == eos_id).nonzero(as_tuple=True)[0]
-            end = eh[0].item() + 1 if len(eh) > 0 else gen_length
+            if gen.dim() == 0:
+                gen = gen.unsqueeze(0)
+            eos_positions = (gen == eos_id).nonzero(as_tuple=False)
+            if len(eos_positions) > 0:
+                end = eos_positions[0, 0].item() + 1
+            else:
+                end = gen.shape[0]
             text = w.tokenizer.decode(gen[:end], skip_special_tokens=True)
             stop = gen_kwargs[b].get("until", gen_kwargs[b].get("stop", []))
             if isinstance(stop, str):
