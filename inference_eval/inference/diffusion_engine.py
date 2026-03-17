@@ -320,24 +320,44 @@ class DiffusionEngine(InferenceEngine):
     ) -> list[str]:
         """Batch-generate via dllm sampler.
 
-        Uses ``build_chat_inputs`` with a list of message-lists to
-        create batched inputs, then ``sampler.sample`` processes them
-        all in one call (the dllm sampler calls ``model.forward``
-        which supports batch_size > 1).
+        Tokenizes each prompt individually, left-pads to the same
+        length, then calls ``sampler.sample`` on the whole batch.
         """
         import dllm.dllm as _dllm
 
-        if self._apply_chat_template:
-            all_messages = [[{"role": "user", "content": p}] for p in prompts]
-            inputs = _dllm.utils.build_chat_inputs(
-                worker.tokenizer,
-                all_messages,
-                add_generation_prompt=True,
-            )
-        else:
-            inputs = worker.tokenizer(
-                prompts, return_tensors="pt", padding=True
-            ).input_ids.to(worker.model.device)
+        torch = self._torch
+
+        # Tokenize each prompt individually
+        all_inputs = []
+        for p in prompts:
+            if self._apply_chat_template:
+                inp = _dllm.utils.build_chat_inputs(
+                    worker.tokenizer,
+                    [[{"role": "user", "content": p}]],
+                    add_generation_prompt=True,
+                )
+            else:
+                inp = worker.tokenizer(p, return_tensors="pt").input_ids.to(
+                    worker.model.device
+                )
+            all_inputs.append(inp)
+
+        # Left-pad to the same length
+        max_len = max(inp.shape[-1] for inp in all_inputs)
+        pad_id = worker.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = worker.tokenizer.eos_token_id or 0
+
+        device = worker.model.device
+        padded = torch.full(
+            (len(all_inputs), max_len),
+            pad_id,
+            dtype=torch.long,
+            device=device,
+        )
+        for i, inp in enumerate(all_inputs):
+            t = inp[0] if inp.dim() > 1 else inp
+            padded[i, max_len - t.shape[0] :] = t.to(device)
 
         kw0 = gen_kwargs[0]
         gen_len = kw0.get("max_gen_toks", kw0.get("max_tokens", self._gen_length))
@@ -351,7 +371,7 @@ class DiffusionEngine(InferenceEngine):
         )
 
         try:
-            outputs = worker.sampler.sample(inputs, cfg, return_dict=True)
+            outputs = worker.sampler.sample(padded, cfg, return_dict=True)
         except Exception as exc:
             self._batch_supported = False
             logger.warning(
@@ -369,7 +389,7 @@ class DiffusionEngine(InferenceEngine):
         replies = _dllm.utils.sample_trim(
             worker.tokenizer,
             outputs.sequences.tolist(),
-            inputs,
+            padded,
         )
 
         results: list[str] = []
