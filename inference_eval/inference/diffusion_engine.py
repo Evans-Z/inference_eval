@@ -60,9 +60,6 @@ class DiffusionEngine(InferenceEngine):
             Ignored if ``devices`` is set.
         devices: Comma-separated devices for multi-GPU parallelism
             (``"cuda:0,cuda:1,cuda:2,cuda:3"``).
-        gpu_batch_size: Number of prompts to process per GPU call.
-            Higher values increase GPU utilization.  Set to the largest
-            value that fits in GPU memory (try 2, 4, 8).
         dtype: Torch dtype (``"bfloat16"``, ``"float16"``, ``"float32"``).
         gen_length: Default number of new tokens to generate.
         block_length: Block length for diffusion sampling.
@@ -79,7 +76,6 @@ class DiffusionEngine(InferenceEngine):
         model: str,
         device: str = "auto",
         devices: str | None = None,
-        gpu_batch_size: int = 1,
         dtype: str = "bfloat16",
         gen_length: int = 512,
         block_length: int = 32,
@@ -111,7 +107,6 @@ class DiffusionEngine(InferenceEngine):
 
         self._model_path = model
         self._torch_dtype = torch_dtype
-        self._gpu_batch_size = gpu_batch_size
         self._gen_length = gen_length
         self._block_length = block_length
         self._steps = steps
@@ -123,7 +118,7 @@ class DiffusionEngine(InferenceEngine):
 
         device_list = [d.strip() for d in devices.split(",")] if devices else [device]
 
-        self._batch_supported: bool | None = None if gpu_batch_size > 1 else False
+        self._batch_supported: bool | None = None
         self._has_dllm = False
         try:
             import dllm.dllm  # noqa: F401
@@ -137,11 +132,10 @@ class DiffusionEngine(InferenceEngine):
             self._workers.append(self._create_worker(dev))
 
         logger.info(
-            "DiffusionEngine ready: %d GPU(s) %s, gpu_batch_size=%d, "
+            "DiffusionEngine ready: %d GPU(s) %s, "
             "dllm=%s, gen_length=%d, steps=%d, block_length=%d",
             len(self._workers),
             [w.device for w in self._workers],
-            gpu_batch_size,
             self._workers[0].sampler is not None,
             gen_length,
             steps,
@@ -293,24 +287,18 @@ class DiffusionEngine(InferenceEngine):
         prompts: list[str],
         gen_kwargs: list[dict[str, Any]],
     ) -> list[str]:
-        """Process prompts on a single worker in mini-batches."""
-        bs = self._gpu_batch_size
+        """Process prompts on a single worker."""
         can_batch = (
-            bs > 1
+            len(prompts) > 1
             and self._batch_supported is not False
             and worker.sampler is not None
             and self._has_dllm
         )
-        results: list[str] = []
-        for i in range(0, len(prompts), bs):
-            batch_p = prompts[i : i + bs]
-            batch_kw = gen_kwargs[i : i + bs]
-            if can_batch and len(batch_p) > 1:
-                results.extend(self._gen_dllm_batch(worker, batch_p, batch_kw))
-            else:
-                for p, kw in zip(batch_p, batch_kw):
-                    results.append(self._generate_single(worker, p, kw))
-        return results
+        if can_batch:
+            return self._gen_dllm_batch(worker, prompts, gen_kwargs)
+        return [
+            self._generate_single(worker, p, kw) for p, kw in zip(prompts, gen_kwargs)
+        ]
 
     def _gen_dllm_batch(
         self,
