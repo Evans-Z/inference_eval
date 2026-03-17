@@ -295,80 +295,68 @@ class DiffusionEngine(InferenceEngine):
     ) -> list[str]:
         """Process prompts on a single worker in mini-batches."""
         bs = self._gpu_batch_size
-        use_batch = bs > 1 and self._batch_supported is not False
+        can_batch = (
+            bs > 1
+            and self._batch_supported is not False
+            and worker.sampler is not None
+            and self._has_dllm
+        )
         results: list[str] = []
         for i in range(0, len(prompts), bs):
             batch_p = prompts[i : i + bs]
             batch_kw = gen_kwargs[i : i + bs]
-            if use_batch and len(batch_p) > 1:
-                results.extend(self._generate_batch(worker, batch_p, batch_kw))
+            if can_batch and len(batch_p) > 1:
+                results.extend(self._gen_dllm_batch(worker, batch_p, batch_kw))
             else:
                 for p, kw in zip(batch_p, batch_kw):
                     results.append(self._generate_single(worker, p, kw))
         return results
 
-    def _generate_batch(
+    def _gen_dllm_batch(
         self,
         worker: _Worker,
         prompts: list[str],
         gen_kwargs: list[dict[str, Any]],
     ) -> list[str]:
-        """Batch-generate: pad multiple prompts and call model once."""
-        all_ids = [self._tokenize_prompt(worker, p) for p in prompts]
-        input_lens = [ids.shape[1] for ids in all_ids]
-        max_len = max(input_lens)
+        """Batch-generate via dllm sampler.
 
-        pad_id = worker.tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = worker.tokenizer.eos_token_id or 0
+        Uses ``build_chat_inputs`` with a list of message-lists to
+        create batched inputs, then ``sampler.sample`` processes them
+        all in one call (the dllm sampler calls ``model.forward``
+        which supports batch_size > 1).
+        """
+        import dllm.dllm as _dllm
 
-        # Left-pad so generation starts at the same position
-        padded = self._torch.full(
-            (len(all_ids), max_len),
-            pad_id,
-            dtype=all_ids[0].dtype,
-            device=worker.model.device,
-        )
-        attention_mask = self._torch.zeros(
-            (len(all_ids), max_len),
-            dtype=self._torch.long,
-            device=worker.model.device,
-        )
-        for i, ids in enumerate(all_ids):
-            seq_len = ids.shape[1]
-            padded[i, max_len - seq_len :] = ids[0]
-            attention_mask[i, max_len - seq_len :] = 1
+        if self._apply_chat_template:
+            all_messages = [[{"role": "user", "content": p}] for p in prompts]
+            inputs = _dllm.utils.build_chat_inputs(
+                worker.tokenizer,
+                all_messages,
+                add_generation_prompt=True,
+            )
+        else:
+            inputs = worker.tokenizer(
+                prompts, return_tensors="pt", padding=True
+            ).input_ids.to(worker.model.device)
 
         kw0 = gen_kwargs[0]
         gen_len = kw0.get("max_gen_toks", kw0.get("max_tokens", self._gen_length))
         temp = kw0.get("temperature", self._temperature)
 
+        cfg = worker.sampler_config_cls(
+            max_new_tokens=gen_len,
+            block_size=self._block_length,
+            steps_per_block=self._steps,
+            temperature=temp,
+        )
+
         try:
-            if worker.sampler is not None:
-                cfg = worker.sampler_config_cls(
-                    max_new_tokens=gen_len,
-                    block_size=self._block_length,
-                    steps_per_block=self._steps,
-                    temperature=temp,
-                )
-                output_ids = worker.sampler.sample(padded, cfg)
-            else:
-                with self._torch.no_grad():
-                    output_ids = worker.model.generate(
-                        inputs=padded,
-                        attention_mask=attention_mask,
-                        gen_length=gen_len,
-                        block_length=self._block_length,
-                        steps=self._steps,
-                        temperature=temp,
-                        eos_early_stop=self._eos_early_stop,
-                    )
+            outputs = worker.sampler.sample(inputs, cfg, return_dict=True)
         except Exception as exc:
             self._batch_supported = False
             logger.warning(
-                "Batch generation not supported by this model (%s). "
-                "Falling back to single-prompt mode for all "
-                "remaining requests.",
+                "Batch generation failed (%s). Falling back to "
+                "single-prompt mode for remaining requests.",
                 exc,
             )
             return [
@@ -378,19 +366,20 @@ class DiffusionEngine(InferenceEngine):
 
         self._batch_supported = True
 
-        # Extract generated text per prompt
+        replies = _dllm.utils.sample_trim(
+            worker.tokenizer,
+            outputs.sequences.tolist(),
+            inputs,
+        )
+
         results: list[str] = []
-        if hasattr(output_ids, "sequences"):
-            output_ids = output_ids.sequences
-        for i in range(len(prompts)):
-            new_ids = output_ids[i][max_len:]
-            text = worker.tokenizer.decode(new_ids, skip_special_tokens=True)
+        for i, reply in enumerate(replies):
             stop = gen_kwargs[i].get("until", gen_kwargs[i].get("stop", []))
             if isinstance(stop, str):
                 stop = [stop]
             if stop:
-                text = _truncate_at_stop(text, stop)
-            results.append(text)
+                reply = _truncate_at_stop(reply, stop)
+            results.append(reply)
         return results
 
     def _generate_single(
