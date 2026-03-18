@@ -495,16 +495,18 @@ class DiffusionEngine(InferenceEngine):
         contexts: list[str],
         continuations: list[str],
     ) -> list[tuple[float, bool]]:
-        """Compute log-likelihoods using the model's diffusion scorer."""
+        """Compute log-likelihoods for diffusion language models.
+
+        Masks all continuation tokens with mask_id, runs a single
+        model.forward() pass, and sums the log-probabilities of
+        the original tokens at the masked positions.  This is the
+        standard single-pass estimator for masked diffusion LMs.
+
+        If the model exposes get_log_likelihood(), that is used
+        instead (may be more accurate with Monte-Carlo sampling).
+        """
         if not contexts:
             return []
-
-        if not hasattr(self._workers[0].model, "get_log_likelihood"):
-            raise NotImplementedError(
-                "This model does not expose get_log_likelihood(). "
-                "Make sure you are using a LLaDA / LLaDA2 model "
-                "loaded with trust_remote_code=True, or install dllm."
-            )
 
         n_workers = len(self._workers)
         if n_workers == 1:
@@ -530,21 +532,48 @@ class DiffusionEngine(InferenceEngine):
     def _ll_single(
         self, worker: _Worker, context: str, continuation: str
     ) -> tuple[float, bool]:
-        ctx_ids = worker.tokenizer(context, return_tensors="pt").input_ids
-        full_ids = worker.tokenizer(
-            context + continuation, return_tensors="pt"
-        ).input_ids
-        ctx_ids = ctx_ids.to(worker.model.device)
-        full_ids = full_ids.to(worker.model.device)
+        torch = self._torch
+        model = worker.model
+        tokenizer = worker.tokenizer
+        device = model.device
 
+        ctx_ids = tokenizer(context, return_tensors="pt").input_ids.to(device)
+        full_ids = tokenizer(context + continuation, return_tensors="pt").input_ids.to(
+            device
+        )
         ctx_len = ctx_ids.shape[1]
-        target_ids = full_ids.clone()
-        target_ids[:, :ctx_len] = -100
+        cont_len = full_ids.shape[1] - ctx_len
 
-        with self._torch.no_grad():
-            ll = worker.model.get_log_likelihood(
-                full_ids, target_ids, mc_num=self._mc_num
-            )
+        if cont_len <= 0:
+            return (0.0, True)
 
-        val = ll.item() if self._torch.is_tensor(ll) else float(ll)
-        return (val, True)
+        # If model has get_log_likelihood, prefer it
+        if hasattr(model, "get_log_likelihood"):
+            target_ids = full_ids.clone()
+            target_ids[:, :ctx_len] = -100
+            with torch.no_grad():
+                ll = model.get_log_likelihood(full_ids, target_ids, mc_num=self._mc_num)
+            val = ll.item() if torch.is_tensor(ll) else float(ll)
+            return (val, True)
+
+        # Diffusion LM loglikelihood: mask continuation, forward, score
+        mask_id = getattr(model.config, "mask_token_id", 156895)
+
+        masked = full_ids.clone()
+        masked[:, ctx_len:] = mask_id
+
+        with torch.no_grad():
+            logits = model(masked).logits
+
+        log_probs = torch.log_softmax(logits[0, ctx_len:].float(), dim=-1)
+        original_tokens = full_ids[0, ctx_len:]
+        token_ll = log_probs[torch.arange(cont_len, device=device), original_tokens]
+        total_ll = token_ll.sum().item()
+
+        logger.debug(
+            "[ll] ctx=%d cont=%d ll=%.4f",
+            ctx_len,
+            cont_len,
+            total_ll,
+        )
+        return (total_ll, True)
