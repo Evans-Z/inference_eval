@@ -537,15 +537,20 @@ class DiffusionEngine(InferenceEngine):
         tokenizer = worker.tokenizer
         device = model.device
 
+        # Tokenize context and continuation SEPARATELY then concatenate.
+        # This avoids token-merging at the boundary that would make
+        # ctx_len wrong (e.g. tokenizer("ab") != tokenizer("a")+tokenizer("b")).
         ctx_ids = tokenizer(context, return_tensors="pt").input_ids.to(device)
-        full_ids = tokenizer(context + continuation, return_tensors="pt").input_ids.to(
-            device
-        )
+        cont_ids = tokenizer(
+            continuation, add_special_tokens=False, return_tensors="pt"
+        ).input_ids.to(device)
         ctx_len = ctx_ids.shape[1]
-        cont_len = full_ids.shape[1] - ctx_len
+        cont_len = cont_ids.shape[1]
 
         if cont_len <= 0:
             return (0.0, True)
+
+        full_ids = torch.cat([ctx_ids, cont_ids], dim=1)
 
         # If model has get_log_likelihood, prefer it
         if hasattr(model, "get_log_likelihood"):
@@ -556,24 +561,46 @@ class DiffusionEngine(InferenceEngine):
             val = ll.item() if torch.is_tensor(ll) else float(ll)
             return (val, True)
 
-        # Diffusion LM loglikelihood: mask continuation, forward, score
+        # Monte-Carlo loglikelihood: multiple random masking patterns.
+        # For each MC sample, randomly mask a subset of continuation
+        # tokens, forward pass, score only the masked ones.  Averaging
+        # gives a better estimate than masking everything at once
+        # (where tokens can't see each other at all).
         mask_id = getattr(model.config, "mask_token_id", 156895)
+        mc_num = self._mc_num
 
-        masked = full_ids.clone()
-        masked[:, ctx_len:] = mask_id
+        total_ll = 0.0
+        total_count = 0
 
         with torch.no_grad():
-            logits = model(masked).logits
+            for _ in range(mc_num):
+                masked = full_ids.clone()
+                # Random mask: each continuation token masked with prob 0.5
+                mask_flag = torch.rand(cont_len, device=device) < 0.5
+                if not mask_flag.any():
+                    mask_flag[0] = True
+                masked[0, ctx_len:][mask_flag] = mask_id
 
-        log_probs = torch.log_softmax(logits[0, ctx_len:].float(), dim=-1)
-        original_tokens = full_ids[0, ctx_len:]
-        token_ll = log_probs[torch.arange(cont_len, device=device), original_tokens]
-        total_ll = token_ll.sum().item()
+                logits = model(masked).logits
+
+                log_probs = torch.log_softmax(logits[0, ctx_len:].float(), dim=-1)
+                original_tokens = full_ids[0, ctx_len:]
+                token_ll = log_probs[
+                    torch.arange(cont_len, device=device), original_tokens
+                ]
+                # Only score the masked tokens
+                total_ll += token_ll[mask_flag].sum().item()
+                total_count += mask_flag.sum().item()
+
+        # Average per-token ll * number of continuation tokens
+        avg_per_token = total_ll / max(total_count, 1)
+        result_ll = avg_per_token * cont_len
 
         logger.debug(
-            "[ll] ctx=%d cont=%d ll=%.4f",
+            "[ll] ctx=%d cont=%d mc=%d ll=%.4f",
             ctx_len,
             cont_len,
-            total_ll,
+            mc_num,
+            result_ll,
         )
-        return (total_ll, True)
+        return (result_ll, True)
