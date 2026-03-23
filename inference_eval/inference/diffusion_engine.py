@@ -83,7 +83,7 @@ class DiffusionEngine(InferenceEngine):
         temperature: float = 0.0,
         apply_chat_template: bool = True,
         eos_early_stop: bool = True,
-        mc_num: int = 32,
+        mc_num: int = 1,
         use_dllm: bool = True,
         **extra_kwargs: Any,
     ) -> None:
